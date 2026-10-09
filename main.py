@@ -385,9 +385,12 @@ def manage_ram() -> None:
 
 
 def main():
-    """Run cleanup on explicit request, otherwise monitor the system."""
+    """Run disk cleanup, live monitoring, and approved RAM management by default."""
     parser = argparse.ArgumentParser(
-        description="FocusOS monitoring with user-approved process and file controls."
+        description=(
+            "Run FocusOS monitoring, automatic safe disk cleanup, and "
+            "user-approved RAM management."
+        )
     )
     parser.add_argument(
         "--cleanup-temp",

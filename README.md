@@ -48,7 +48,8 @@ python main.py
 ## Live terminal monitoring and process controls
 
 Run FocusOS directly in the terminal; Uvicorn is optional and is not needed for
-this mode:
+this mode. A single command starts the normal integrated workflow—no cleanup or
+RAM-management flags are required:
 
 ```bash
 python main.py
@@ -139,13 +140,14 @@ restore processes managed by FocusOS. If FocusOS is forcibly terminated or the
 computer loses power, it cannot restore a process before shutdown. Review the
 allowlist carefully: suspending an application can interrupt its work.
 
-On normal startup, FocusOS shows eligible background process instances sorted
-by RAM use and asks which exact instances it may manage for this run. After the
+On the same normal startup, FocusOS shows eligible background process instances
+sorted by RAM use and asks which exact instances it may manage for this run. After the
 explicit `AUTO SUSPEND` confirmation, only those selected instances are
 automatically suspended after two minutes in the background and restored on
 refocus or Ctrl+C. Press Enter or decline the confirmation to stay in monitoring
-only. Selecting a browser helper/renderer may interrupt a tab, so select only
-processes you recognize.
+only for RAM. This approval avoids suspending an app or interrupting unsaved work
+without your permission. Selecting a browser helper/renderer may interrupt a tab,
+so select only processes you recognize.
 
 For one-time, user-selected RAM management without editing the allowlist, run:
 

@@ -269,7 +269,10 @@ def test_auto_ram_startup_enables_only_explicitly_confirmed_processes(monkeypatc
 
 
 @pytest.mark.parametrize("skip_disk_review", [False, True])
-def test_normal_startup_runs_disk_review_unless_explicitly_skipped(monkeypatch, skip_disk_review):
+def test_normal_startup_runs_integrated_cleanup_monitoring_and_ram_setup(
+    monkeypatch,
+    skip_disk_review,
+):
     events = []
 
     class Runtime:
@@ -329,7 +332,11 @@ def test_normal_startup_runs_disk_review_unless_explicitly_skipped(monkeypatch, 
         "optimize_disk",
         lambda: events.append("disk-review"),
     )
-    monkeypatch.setattr(focusos_main, "configure_auto_ram_management", lambda state: None)
+    monkeypatch.setattr(
+        focusos_main,
+        "configure_auto_ram_management",
+        lambda state: events.append("ram-setup"),
+    )
 
     def interrupt(_seconds):
         raise KeyboardInterrupt
@@ -344,9 +351,10 @@ def test_normal_startup_runs_disk_review_unless_explicitly_skipped(monkeypatch, 
 
     if skip_disk_review:
         assert "disk-review" not in events
-        assert events[0] == "monitor-start"
+        assert events[:2] == ["monitor-start", "ram-setup"]
     else:
         assert events.index("disk-review") < events.index("monitor-start")
+        assert events.index("monitor-start") < events.index("ram-setup")
 
 
 def test_process_manager_does_not_change_unallowlisted_process():
