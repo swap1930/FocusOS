@@ -23,6 +23,7 @@ FocusOS/
 |-- dashboard/
 |   |-- main_window.py
 |   |-- performance_monitor.py
+|   |-- desktop_app.py
 |   |-- widgets/
 |-- api/
 |   |-- focus_api.py
@@ -45,14 +46,30 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-## Live terminal monitoring and process controls
-
-Run FocusOS directly in the terminal; Uvicorn is optional and is not needed for
-this mode. A single command starts the normal integrated workflow—no cleanup or
-RAM-management flags are required:
+`main.py` is the project entry point and opens the native PySide6 desktop dashboard by default.
+It starts monitoring automatically and updates existing widgets every two seconds, without
+reloading a browser page:
 
 ```bash
 python main.py
+```
+
+The original console workflow remains available explicitly:
+
+```bash
+.\venv\Scripts\python.exe main.py --terminal
+```
+
+The dashboard shows CPU/RAM/disk/GPU metrics, current focus, resource warnings, process priority,
+and top memory consumers. It also provides Start/Pause/Resume/Stop controls and live resource and
+process-count charts. Chart history is capped at 120 samples.
+
+## Live terminal monitoring and process controls
+
+Run the legacy terminal monitoring workflow explicitly; Uvicorn is optional and is not needed:
+
+```bash
+python main.py --terminal
 ```
 
 The terminal refreshes foreground application/window/task, CPU, RAM, disk, optional

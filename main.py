@@ -19,6 +19,13 @@ api = FocusAPI()
 app = api.create_app()
 
 
+def run_desktop_dashboard() -> None:
+    """Start the native FocusOS dashboard using the shared runtime."""
+    from dashboard.desktop_app import run_dashboard
+
+    run_dashboard(api.runtime)
+
+
 def review_and_clean_folder(
     label: str,
     root: Path,
@@ -385,11 +392,10 @@ def manage_ram() -> None:
 
 
 def main():
-    """Run disk cleanup, live monitoring, and approved RAM management by default."""
+    """Launch the live dashboard by default or run an explicitly selected tool."""
     parser = argparse.ArgumentParser(
         description=(
-            "Run FocusOS monitoring, automatic safe disk cleanup, and "
-            "user-approved RAM management."
+            "Launch the FocusOS desktop dashboard, terminal monitor, or a selected maintenance tool."
         )
     )
     parser.add_argument(
@@ -422,7 +428,13 @@ def main():
         action="store_true",
         help="start monitoring without reviewing disk-cleanup candidates",
     )
+    parser.add_argument(
+        "--terminal",
+        action="store_true",
+        help="launch the original terminal monitoring workflow instead of the desktop dashboard",
+    )
     args = parser.parse_args()
+
     if args.cleanup_temp:
         cleanup_temp_files()
         return
@@ -437,6 +449,10 @@ def main():
         return
     if args.collect_python_garbage:
         print(f"Collected {gc.collect()} unreachable FocusOS Python objects.")
+        return
+
+    if not args.terminal:
+        run_desktop_dashboard()
         return
 
     if not args.skip_disk_review:

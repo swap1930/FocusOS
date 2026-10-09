@@ -18,6 +18,7 @@ from core.resource_manager import ResourceManager
 from core.storage_manager import StorageManager
 from core.system_monitor import SystemMonitor
 from dashboard.main_window import MainWindow
+from dashboard.desktop_app import HISTORY_LIMIT, MetricHistory
 from main import configure_auto_ram_management, review_and_clean_folder
 
 
@@ -186,6 +187,41 @@ def test_configured_process_suspension_delay_is_two_minutes():
     assert runtime.process_manager.suspend_after_seconds == 120
 
 
+def test_main_launches_desktop_dashboard_by_default(monkeypatch):
+    calls = []
+    monkeypatch.setattr("sys.argv", ["main.py"])
+    monkeypatch.setattr(
+        focusos_main,
+        "run_desktop_dashboard",
+        lambda: calls.append("desktop"),
+    )
+
+    focusos_main.main()
+
+    assert calls == ["desktop"]
+
+
+def test_dashboard_metric_history_is_bounded_and_records_resource_values():
+    history = MetricHistory()
+    state = {
+        "cpu_usage": 21.5,
+        "ram_usage": 63.0,
+        "disk_usage": 44.0,
+        "gpu_usage": 81.0,
+        "active_processes": 3,
+        "background_processes": 8,
+        "suspended_processes": 1,
+    }
+
+    for _ in range(HISTORY_LIMIT + 1):
+        history.record(state)
+
+    assert len(history.samples) == HISTORY_LIMIT
+    assert history.samples[-1]["CPU %"] == 21.5
+    assert history.samples[-1]["GPU %"] == 81.0
+    assert history.samples[-1]["Background"] == 8
+
+
 def test_selected_background_process_is_auto_suspended_after_two_minutes_and_restored():
     now = [0.0]
     username = psutil.Process().username()
@@ -344,7 +380,8 @@ def test_normal_startup_runs_integrated_cleanup_monitoring_and_ram_setup(
     monkeypatch.setattr(focusos_main.time, "sleep", interrupt)
     monkeypatch.setattr(
         "sys.argv",
-        ["main.py"] + (["--skip-disk-review"] if skip_disk_review else []),
+        ["main.py", "--terminal"]
+        + (["--skip-disk-review"] if skip_disk_review else []),
     )
 
     focusos_main.main()
