@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from typing import Dict, Optional
 
 
@@ -23,7 +24,7 @@ class FocusEngine:
         self.user_activity = "active"
         self.focus_mode = "idle"
         self.focus_score = 0
-        self.task_history = []
+        self.task_history = deque(maxlen=300)
 
     def detect_active_application(self):
         """Return the currently active application name."""

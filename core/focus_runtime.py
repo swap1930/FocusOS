@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional
 
+from config.settings import AUTO_SUSPEND_ALLOWLIST, AUTO_SUSPEND_DELAY_SECONDS
 from core.focus_engine import FocusEngine
 from core.process_manager import ProcessManager
+from core.resource_manager import ResourceManager
 from core.system_monitor import SystemMonitor
 
 
@@ -21,11 +23,21 @@ class FocusOSState:
     focus_score: int = 0
     cpu_usage: float = 0.0
     ram_usage: float = 0.0
+    ram_available_bytes: int = 0
+    ram_total_bytes: int = 0
+    disk_usage: float = 0.0
+    disk_free_bytes: int = 0
+    disk_total_bytes: int = 0
     gpu_usage: Optional[float] = None
+    resource_status: str = "NORMAL"
+    resource_warnings: List[str] = field(default_factory=list)
     active_processes: int = 0
     background_processes: int = 0
     suspended_processes: int = 0
+    working_set_trimmed_bytes: int = 0
     priority_plan: Optional[List[Dict[str, object]]] = None
+    top_memory_processes: List[Dict[str, object]] = field(default_factory=list)
+    process_action_errors: List[str] = field(default_factory=list)
 
 
 class FocusRuntime:
@@ -36,10 +48,19 @@ class FocusRuntime:
         monitor: Optional[SystemMonitor] = None,
         focus_engine: Optional[FocusEngine] = None,
         process_manager: Optional[ProcessManager] = None,
+        resource_manager: Optional[ResourceManager] = None,
     ):
         self.monitor = monitor or SystemMonitor()
         self.focus_engine = focus_engine or FocusEngine()
-        self.process_manager = process_manager or ProcessManager()
+        self.resource_manager = resource_manager or ResourceManager()
+        active_pid_provider = getattr(self.monitor, "get_active_window_pid", None)
+        if not callable(active_pid_provider):
+            active_pid_provider = None
+        self.process_manager = process_manager or ProcessManager(
+            allowlist=AUTO_SUSPEND_ALLOWLIST,
+            suspend_after_seconds=AUTO_SUSPEND_DELAY_SECONDS,
+            active_pid_provider=active_pid_provider,
+        )
         self.state = FocusOSState()
 
     def start(self) -> Dict[str, object]:
@@ -63,6 +84,8 @@ class FocusRuntime:
 
     def stop(self) -> Dict[str, object]:
         """Stop FocusOS monitoring without changing user processes."""
+        self.state.process_action_errors = self.process_manager.restore_all()
+        self.state.suspended_processes = self.process_manager.suspended_count
         self.state.status = "STOPPED"
         return self.snapshot()
 
@@ -91,7 +114,11 @@ class FocusRuntime:
         processes = metrics["processes"]
         if not isinstance(processes, list):
             raise TypeError("System monitor processes must be a list.")
-        priority_plan = self.process_manager.build_priority_plan(processes, window.get("pid"))
+        priority_plan = self.process_manager.build_priority_plan(
+            processes,
+            window.get("pid"),
+            apply_controls=self.state.status == "RUNNING",
+        )
 
         self.state.focus_application = application
         self.state.focus_window = title
@@ -99,12 +126,40 @@ class FocusRuntime:
         self.state.focus_score = int(focus["focus_score"])
         self.state.cpu_usage = float(metrics["cpu_usage"])
         self.state.ram_usage = float(metrics["ram_usage"])
+        self.state.ram_available_bytes = int(metrics.get("ram_available_bytes", 0))
+        self.state.ram_total_bytes = int(metrics.get("ram_total_bytes", 0))
+        self.state.disk_usage = float(metrics.get("disk_usage", 0.0))
+        self.state.disk_free_bytes = int(metrics.get("disk_free_bytes", 0))
+        self.state.disk_total_bytes = int(metrics.get("disk_total_bytes", 0))
         self.state.gpu_usage = metrics["gpu_usage"]
+        resource_assessment = self.resource_manager.assess(
+            self.state.cpu_usage,
+            self.state.ram_usage,
+            self.state.disk_usage,
+        )
+        self.state.resource_status = str(resource_assessment["status"])
+        self.state.resource_warnings = list(resource_assessment["warnings"])
         self.state.active_processes = sum(item["classification"] == "active" for item in priority_plan)
         self.state.background_processes = sum(
             item["classification"] in {"background", "idle"} for item in priority_plan
         )
+        self.state.suspended_processes = sum(bool(item["suspended"]) for item in priority_plan)
+        self.state.working_set_trimmed_bytes = self.process_manager.working_set_trimmed_bytes
         self.state.priority_plan = priority_plan
+        self.state.top_memory_processes = sorted(
+            (
+                {
+                    "pid": item["pid"],
+                    "name": item["name"],
+                    "memory_mb": round(float(item.get("memory_rss", 0)) / (1024 * 1024), 1),
+                    "classification": item["classification"],
+                }
+                for item in priority_plan
+            ),
+            key=lambda item: float(item["memory_mb"]),
+            reverse=True,
+        )[:5]
+        self.state.process_action_errors = list(self.process_manager.action_errors)
         return self.snapshot()
 
     def snapshot(self) -> Dict[str, object]:

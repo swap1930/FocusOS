@@ -5,6 +5,7 @@ from typing import Callable, Dict
 from fastapi import FastAPI, HTTPException
 
 from core.focus_runtime import FocusRuntime
+from core.storage_manager import StorageManager
 
 
 class FocusAPI:
@@ -13,6 +14,7 @@ class FocusAPI:
     def __init__(self, runtime: FocusRuntime | None = None):
         self.status = "ready"
         self.runtime = runtime or FocusRuntime()
+        self.storage_manager = StorageManager()
 
     def healthcheck(self):
         """Return the health status of the service."""
@@ -55,6 +57,10 @@ class FocusAPI:
         @app.post("/emergency-disable")
         def emergency_disable():
             return self.runtime.emergency_disable()
+
+        @app.get("/storage/candidates")
+        def storage_candidates():
+            return self.storage_manager.scan_candidates()
 
         return app
 
