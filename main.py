@@ -20,8 +20,8 @@ app = api.create_app()
 
 
 def run_desktop_dashboard() -> None:
-    """Start the native FocusOS dashboard using the shared runtime."""
-    from dashboard.desktop_app import run_dashboard
+    """Start the Qt Quick dashboard using the shared runtime."""
+    from dashboard_qml import run_dashboard
 
     run_dashboard(api.runtime)
 
