@@ -1,5 +1,7 @@
 """Smoke tests for the FocusOS focus engine."""
 
+import ctypes
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,9 +12,15 @@ from fastapi import HTTPException
 import main as focusos_main
 
 from api.focus_api import FocusAPI
-from config.settings import AUTO_SUSPEND_DELAY_SECONDS, CLEANUP_AUTO_MIN_AGE_SECONDS
+from config.settings import (
+    AUTO_OPTIMIZE_USER_PROCESSES,
+    AUTO_SUSPEND_DELAY_SECONDS,
+    CLEANUP_AUTO_MIN_AGE_SECONDS,
+)
+from core import elevation, gnome_focus, process_manager as process_manager_module
 from core.focus_engine import FocusEngine
 from core.focus_runtime import FocusRuntime
+from core.platform_support import is_windows
 from core.process_manager import ProcessManager
 from core.resource_manager import ResourceManager
 from core.storage_manager import StorageManager
@@ -146,7 +154,8 @@ def test_system_monitor_averages_gpu_utilization_when_nvidia_smi_is_available(mo
     assert SystemMonitor._get_gpu_usage() == 30.0
 
 
-def test_process_manager_suspends_and_restores_allowlisted_process_after_delay():
+def test_process_manager_suspends_and_restores_allowlisted_process_after_delay(monkeypatch):
+    monkeypatch.setattr("core.process_manager.is_windows", lambda: True)
     now = [0.0]
     username = psutil.Process().username()
     process = ManagedFakeProcess(50000, "Editor.exe", username)
@@ -222,7 +231,8 @@ def test_dashboard_metric_history_is_bounded_and_records_resource_values():
     assert history.samples[-1]["Background"] == 8
 
 
-def test_selected_background_process_is_auto_suspended_after_two_minutes_and_restored():
+def test_selected_background_process_is_auto_suspended_after_two_minutes_and_restored(monkeypatch):
+    monkeypatch.setattr("core.process_manager.is_windows", lambda: True)
     now = [0.0]
     username = psutil.Process().username()
     process = ManagedFakeProcess(50006, "Editor.exe", username)
@@ -316,7 +326,11 @@ def test_normal_startup_runs_integrated_cleanup_monitoring_and_ram_setup(
         process_manager = type(
             "Manager",
             (),
-            {"allowlist": set(), "selected_process_count": 0},
+            {
+                "allowlist": set(),
+                "selected_process_count": 0,
+                "auto_optimize_user_processes": False,
+            },
         )()
 
         def start(self):
@@ -414,6 +428,419 @@ def test_process_manager_does_not_change_unallowlisted_process():
     assert plan[0]["suspended"] is False
     assert process._suspend_calls == 0
     assert process.nice() == 0
+
+
+def test_auto_optimization_prioritizes_focus_and_trims_eligible_background_apps(monkeypatch):
+    monkeypatch.setattr("core.process_manager.is_windows", lambda: True)
+    now = [0.0]
+    active_pid = [50010]
+    username = psutil.Process().username()
+    focused = ManagedFakeProcess(50010, "Editor.exe", username)
+    background = ManagedFakeProcess(50011, "Browser.exe", username)
+    protected = ManagedFakeProcess(50012, "svchost.exe", username)
+    processes = {50010: focused, 50011: background, 50012: protected}
+    trim_calls = []
+    manager = ProcessManager(
+        suspend_after_seconds=120,
+        clock=lambda: now[0],
+        process_factory=lambda pid: processes[pid],
+        active_pid_provider=lambda: active_pid[0],
+        working_set_trimmer=lambda pid: (
+            trim_calls.append(pid) or (16 * 1024 * 1024, None)
+        ),
+    )
+    manager.auto_optimize_user_processes = True
+    process_info = [
+        {"pid": 50010, "name": "Editor.exe", "create_time": 123.0},
+        {"pid": 50011, "name": "Browser.exe", "create_time": 123.0},
+        {"pid": 50012, "name": "svchost.exe", "create_time": 123.0},
+    ]
+
+    manager.build_priority_plan(process_info, focus_pid=50010)
+    assert focused.nice() == psutil.ABOVE_NORMAL_PRIORITY_CLASS
+    assert background.nice() == psutil.BELOW_NORMAL_PRIORITY_CLASS
+    assert protected.nice() == 0
+
+    now[0] = 120.0
+    plan = manager.build_priority_plan(process_info, focus_pid=50010)
+    assert trim_calls == [50011]
+    assert manager.working_set_trimmed_bytes == 16 * 1024 * 1024
+    assert next(row for row in plan if row["pid"] == 50011)["suspended"] is False
+
+    active_pid[0] = 50011
+    manager.build_priority_plan(process_info, focus_pid=50011)
+    assert focused.nice() == psutil.BELOW_NORMAL_PRIORITY_CLASS
+    assert background.nice() == psutil.ABOVE_NORMAL_PRIORITY_CLASS
+
+    manager.restore_all()
+    assert focused.nice() == 0
+    assert background.nice() == 0
+    monkeypatch.undo()
+
+
+def test_focus_runtime_enables_configured_automatic_optimization():
+    runtime = FocusRuntime(monitor=FakeMonitor())
+
+    assert AUTO_OPTIMIZE_USER_PROCESSES is True
+    assert runtime.process_manager.auto_optimize_user_processes is is_windows()
+
+
+def test_focus_runtime_enables_supported_optimization_on_linux(monkeypatch):
+    monkeypatch.setattr("core.focus_runtime.is_windows", lambda: False)
+    monkeypatch.setattr("core.focus_runtime.is_linux", lambda: True)
+
+    runtime = FocusRuntime(monitor=FakeMonitor())
+
+    assert runtime.platform == "Linux"
+    assert runtime.process_manager.auto_optimize_user_processes is True
+
+
+def test_linux_auto_optimization_batches_background_and_restores_foreground(monkeypatch):
+    monkeypatch.setattr("core.process_manager.is_windows", lambda: False)
+    monkeypatch.setattr("core.process_manager.is_linux", lambda: True)
+    monkeypatch.setattr(os, "SCHED_OTHER", 0, raising=False)
+    monkeypatch.setattr(os, "SCHED_BATCH", 3, raising=False)
+    now = [0.0]
+    active_pid = [50020]
+    username = psutil.Process().username()
+    focused = ManagedFakeProcess(50020, "editor", username)
+    background = ManagedFakeProcess(50021, "browser", username)
+    processes = {50020: focused, 50021: background}
+    policies = {50020: 0, 50021: 0}
+    scheduler_calls = []
+
+    def set_scheduler(pid, policy, parameter):
+        policies[pid] = policy
+        scheduler_calls.append((pid, policy))
+
+    monkeypatch.setattr(os, "sched_getscheduler", lambda pid: policies[pid], raising=False)
+    monkeypatch.setattr(
+        os,
+        "sched_getparam",
+        lambda pid: SimpleNamespace(sched_priority=0),
+        raising=False,
+    )
+    monkeypatch.setattr(os, "sched_setscheduler", set_scheduler, raising=False)
+    monkeypatch.setattr(os, "sched_param", lambda priority: SimpleNamespace(sched_priority=priority), raising=False)
+    trim_calls = []
+    manager = ProcessManager(
+        suspend_after_seconds=120,
+        clock=lambda: now[0],
+        process_factory=lambda pid: processes[pid],
+        active_pid_provider=lambda: active_pid[0],
+        working_set_trimmer=lambda pid: (
+            trim_calls.append(pid) or (4 * 1024 * 1024, None)
+        ),
+    )
+    manager.auto_optimize_user_processes = True
+    process_info = [
+        {"pid": 50020, "name": "editor", "create_time": 123.0},
+        {"pid": 50021, "name": "browser", "create_time": 123.0},
+    ]
+
+    manager.build_priority_plan(process_info, focus_pid=50020)
+    assert policies == {50020: 0, 50021: 3}
+    now[0] = 120.0
+    manager.build_priority_plan(process_info, focus_pid=50020)
+    assert trim_calls == [50021]
+    assert manager.working_set_trimmed_bytes == 4 * 1024 * 1024
+
+    active_pid[0] = 50021
+    manager.build_priority_plan(process_info, focus_pid=50021)
+    assert policies[50021] == 0
+    assert (50021, 0) in scheduler_calls
+    assert manager.restore_all() == []
+
+
+def test_linux_pageout_targets_private_mappings_and_measures_rss_change(monkeypatch):
+    import builtins
+    import io
+
+    monkeypatch.setattr("core.process_manager.is_linux", lambda: True)
+    monkeypatch.setattr(
+        os,
+        "uname",
+        lambda: SimpleNamespace(machine="x86_64"),
+        raising=False,
+    )
+    monkeypatch.setattr(os, "pidfd_open", lambda pid: 77, raising=False)
+    monkeypatch.setattr(os, "sysconf", lambda key: 4096, raising=False)
+    closed = []
+    monkeypatch.setattr(os, "close", lambda pidfd: closed.append(pidfd))
+    rss_values = iter([100 * 1024 * 1024, 88 * 1024 * 1024])
+    monkeypatch.setattr(
+        "core.process_manager.psutil.Process",
+        lambda pid: SimpleNamespace(
+            memory_info=lambda: SimpleNamespace(rss=next(rss_values))
+        ),
+    )
+    maps = (
+        "1000-5000 rw-p 00000000 00:00 0 [heap]\n"
+        "6000-9000 rw-s 00000000 00:00 0 /shared\n"
+    )
+    monkeypatch.setattr(builtins, "open", lambda *args, **kwargs: io.StringIO(maps))
+    monkeypatch.setattr(
+        "core.process_manager.ctypes.CDLL",
+        lambda *args, **kwargs: SimpleNamespace(syscall=SimpleNamespace()),
+    )
+    advised = []
+    monkeypatch.setattr(
+        ProcessManager,
+        "_advise_linux_pages",
+        staticmethod(
+            lambda syscall, number, pidfd, start, length: (
+                advised.append((pidfd, start, length)) or length
+            )
+        ),
+    )
+
+    reclaimed, warning = ProcessManager._trim_working_set(50030)
+
+    assert reclaimed == 12 * 1024 * 1024
+    assert warning is None
+    assert advised == [(77, 0x1000, 0x4000)]
+    assert closed == [77]
+
+
+def test_linux_process_madvise_uses_remote_iovec_and_pageout_advice():
+    calls = []
+
+    def fake_syscall(number, pidfd, iovec_pointer, count, advice, flags):
+        vector = ctypes.cast(
+            iovec_pointer,
+            ctypes.POINTER(process_manager_module._LinuxIOVec),
+        ).contents
+        calls.append(
+            (
+                number,
+                pidfd,
+                vector.base,
+                vector.length,
+                count.value,
+                advice,
+                flags,
+            )
+        )
+        return vector.length
+
+    advised = ProcessManager._advise_linux_pages(
+        fake_syscall,
+        440,
+        77,
+        0x1000,
+        4096,
+    )
+
+    assert advised == 4096
+    assert calls == [(440, 77, 0x1000, 4096, 1, 21, 0)]
+
+
+def test_linux_active_window_detection_uses_xdotool_on_x11(monkeypatch):
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setenv("XDG_SESSION_TYPE", "x11")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr("core.system_monitor.shutil.which", lambda name: "/usr/bin/xdotool")
+    outputs = iter(["0x42\n", "1234\n", "FocusOS test window\n"])
+    monkeypatch.setattr(
+        "core.system_monitor.subprocess.run",
+        lambda *args, **kwargs: SimpleNamespace(stdout=next(outputs)),
+    )
+    monkeypatch.setattr(
+        "core.system_monitor.psutil.Process",
+        lambda pid: SimpleNamespace(name=lambda: "editor"),
+    )
+
+    result = SystemMonitor._get_linux_active_window()
+
+    assert result == {
+        "application": "editor",
+        "title": "FocusOS test window",
+        "pid": 1234,
+        "warning": None,
+    }
+
+
+def test_linux_active_window_detection_does_not_guess_under_wayland(monkeypatch):
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.delenv("XDG_CURRENT_DESKTOP", raising=False)
+    monkeypatch.delenv("XDG_SESSION_DESKTOP", raising=False)
+    monkeypatch.delenv("DESKTOP_SESSION", raising=False)
+    run_calls = []
+    monkeypatch.setattr(
+        "core.system_monitor.subprocess.run",
+        lambda *args, **kwargs: run_calls.append(args),
+    )
+
+    result = SystemMonitor._get_linux_active_window()
+
+    assert result["pid"] is None
+    assert "Wayland" in result["warning"]
+    assert run_calls == []
+
+
+def test_gnome_wayland_extension_installs_for_current_user_and_enables(monkeypatch, tmp_path):
+    source = tmp_path / "extension-source"
+    source.mkdir()
+    (source / "metadata.json").write_text("metadata", encoding="utf-8")
+    (source / "extension.js").write_text("extension", encoding="utf-8")
+    home = tmp_path / "home"
+    monkeypatch.setattr(gnome_focus, "_extension_source", lambda: source)
+    monkeypatch.setattr(gnome_focus.shutil, "which", lambda command: "/usr/bin/gnome-extensions")
+    monkeypatch.setattr(gnome_focus.Path, "home", lambda: home)
+    calls = []
+    monkeypatch.setattr(
+        gnome_focus.subprocess,
+        "run",
+        lambda command, **kwargs: calls.append((command, kwargs))
+        or SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    warning = gnome_focus.ensure_extension_enabled()
+
+    extension_dir = (
+        home / ".local" / "share" / "gnome-shell" / "extensions" / gnome_focus.EXTENSION_UUID
+    )
+    assert warning is None
+    assert (extension_dir / "extension.js").read_text(encoding="utf-8") == "extension"
+    assert calls[0][0] == ["/usr/bin/gnome-extensions", "enable", gnome_focus.EXTENSION_UUID]
+
+
+def test_gnome_wayland_active_window_reads_local_dbus_response(monkeypatch):
+    monkeypatch.setattr(gnome_focus.shutil, "which", lambda command: "/usr/bin/gdbus")
+    state = {
+        "pid": 1234,
+        "application": "org.example.Editor",
+        "title": "FocusOS.py",
+        "warning": None,
+    }
+    calls = []
+    monkeypatch.setattr(
+        gnome_focus.subprocess,
+        "run",
+        lambda command, **kwargs: calls.append(command)
+        or SimpleNamespace(
+            stdout=f"({json.dumps(json.dumps(state))},)",
+        ),
+    )
+
+    result = gnome_focus.get_active_window()
+
+    assert result == state
+    assert calls[0][-1] == gnome_focus.DBUS_METHOD
+
+
+def test_wayland_focus_auto_installs_extension_for_gnome(monkeypatch):
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "GNOME")
+    monkeypatch.setattr("core.system_monitor.is_gnome_wayland", lambda: True)
+    monkeypatch.setattr(SystemMonitor, "_gnome_setup_checked", False)
+    monkeypatch.setattr(SystemMonitor, "_gnome_setup_warning", None)
+    setup_calls = []
+    monkeypatch.setattr(
+        "core.system_monitor.ensure_extension_enabled",
+        lambda: setup_calls.append(True),
+    )
+    state = {"pid": 900, "application": "editor", "title": "code.py", "warning": None}
+    monkeypatch.setattr(
+        "core.system_monitor.get_gnome_active_window",
+        lambda: state,
+    )
+
+    result = SystemMonitor._get_linux_active_window()
+
+    assert result == state
+    assert setup_calls == [True]
+    assert SystemMonitor._get_linux_active_window() == state
+    assert setup_calls == [True]
+
+
+def test_elevated_restart_requests_uac_and_waits_for_old_instance(monkeypatch):
+    launch = {}
+    monkeypatch.setattr(elevation, "supports_admin_restart", lambda: True)
+    monkeypatch.setattr(elevation.sys, "executable", r"C:\Python\python.exe")
+    monkeypatch.setattr(
+        elevation,
+        "_shell_execute_runas",
+        lambda executable, parameters, cwd: (
+            launch.update(
+                executable=executable,
+                parameters=parameters,
+                cwd=cwd,
+            )
+            or 33
+        ),
+    )
+
+    result = elevation.request_elevated_restart(
+        [r"D:\FocusOS\main.py", "--terminal"],
+        wait_for_pid=321,
+    )
+
+    assert result is None
+    assert launch["executable"] == r"C:\Python\python.exe"
+    assert "--wait-for-process 321" in launch["parameters"]
+    assert r"D:\FocusOS\main.py" in launch["parameters"]
+    assert "--terminal" in launch["parameters"]
+
+
+def test_elevated_restart_reports_uac_cancellation(monkeypatch):
+    monkeypatch.setattr(elevation, "supports_admin_restart", lambda: True)
+    monkeypatch.setattr(
+        elevation,
+        "_shell_execute_runas",
+        lambda executable, parameters, cwd: 5,
+    )
+
+    error = elevation.request_elevated_restart([r"D:\FocusOS\main.py"], 321)
+
+    assert error is not None
+    assert "cancelled" in error
+
+
+def test_elevated_restart_waits_for_previous_process(monkeypatch):
+    waited = []
+
+    class PreviousProcess:
+        def wait(self):
+            waited.append(True)
+
+    monkeypatch.setattr(elevation.psutil, "Process", lambda pid: PreviousProcess())
+
+    elevation.wait_for_process_exit(321)
+
+    assert waited == [True]
+
+
+def test_auto_optimization_skips_memory_trim_if_foreground_changes():
+    now = [0.0]
+    username = psutil.Process().username()
+    focused = ManagedFakeProcess(50013, "Editor.exe", username)
+    background = ManagedFakeProcess(50014, "Browser.exe", username)
+    processes = {50013: focused, 50014: background}
+    active_pids = iter([50013, 50013, 50014])
+    trim_calls = []
+    manager = ProcessManager(
+        suspend_after_seconds=120,
+        clock=lambda: now[0],
+        process_factory=lambda pid: processes[pid],
+        active_pid_provider=lambda: next(active_pids),
+        working_set_trimmer=lambda pid: (
+            trim_calls.append(pid) or (8 * 1024 * 1024, None)
+        ),
+    )
+    manager.auto_optimize_user_processes = True
+    process_info = [
+        {"pid": 50013, "name": "Editor.exe", "create_time": 123.0},
+        {"pid": 50014, "name": "Browser.exe", "create_time": 123.0},
+    ]
+
+    manager.build_priority_plan(process_info, focus_pid=50013)
+    now[0] = 120.0
+    manager.build_priority_plan(process_info, focus_pid=50013)
+
+    assert trim_calls == []
+    assert manager.working_set_trimmed_bytes == 0
+    manager.restore_all()
 
 
 def test_process_manager_never_suspends_protected_system_processes():

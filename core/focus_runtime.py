@@ -5,8 +5,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional
 
-from config.settings import AUTO_SUSPEND_ALLOWLIST, AUTO_SUSPEND_DELAY_SECONDS
+from config.settings import (
+    AUTO_OPTIMIZE_USER_PROCESSES,
+    AUTO_SUSPEND_ALLOWLIST,
+    AUTO_SUSPEND_DELAY_SECONDS,
+)
 from core.focus_engine import FocusEngine
+from core.platform_support import is_linux, is_windows
 from core.process_manager import ProcessManager
 from core.resource_manager import ResourceManager
 from core.system_monitor import SystemMonitor
@@ -19,6 +24,7 @@ class FocusOSState:
     status: str = "STOPPED"
     focus_application: Optional[str] = None
     focus_window: Optional[str] = None
+    focus_detection_warning: Optional[str] = None
     focus_mode: str = "idle"
     focus_score: int = 0
     cpu_usage: float = 0.0
@@ -61,6 +67,10 @@ class FocusRuntime:
             suspend_after_seconds=AUTO_SUSPEND_DELAY_SECONDS,
             active_pid_provider=active_pid_provider,
         )
+        self.process_manager.auto_optimize_user_processes = (
+            AUTO_OPTIMIZE_USER_PROCESSES and (is_windows() or is_linux())
+        )
+        self.platform = "Windows" if is_windows() else "Linux" if is_linux() else "Unsupported"
         self.state = FocusOSState()
 
     def start(self) -> Dict[str, object]:
@@ -122,6 +132,9 @@ class FocusRuntime:
 
         self.state.focus_application = application
         self.state.focus_window = title
+        self.state.focus_detection_warning = (
+            str(window["warning"]) if window.get("warning") else None
+        )
         self.state.focus_mode = str(focus["focus_mode"])
         self.state.focus_score = int(focus["focus_score"])
         self.state.cpu_usage = float(metrics["cpu_usage"])

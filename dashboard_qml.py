@@ -6,6 +6,7 @@ lives in the ``qml`` folder next to this file and is GPU rendered.
 
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -27,7 +28,9 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 
+from core.elevation import is_user_admin, request_elevated_restart
 from core.focus_runtime import FocusRuntime
+from core.platform_support import supports_admin_restart
 
 
 QML_DIR = Path(__file__).resolve().parent / "qml"
@@ -196,6 +199,7 @@ class DashboardBackend(QObject):
         self._control_pending = False
         self._closing = False
         self._shutdown_complete = False
+        self._is_elevated = is_user_admin()
 
         self._dark = False
 
@@ -243,6 +247,18 @@ class DashboardBackend(QObject):
     @Property(bool, notify=darkModeChanged)
     def darkMode(self) -> bool:
         return self._dark
+
+    @Property(bool, constant=True)
+    def isElevated(self) -> bool:
+        return self._is_elevated
+
+    @Property(bool, constant=True)
+    def supportsAdminRestart(self) -> bool:
+        return supports_admin_restart()
+
+    @Property(str, constant=True)
+    def platformName(self) -> str:
+        return self.runtime.platform
 
     @Property(bool, notify=controlsChanged)
     def canStart(self) -> bool:
@@ -320,6 +336,25 @@ class DashboardBackend(QObject):
     def emergencyDisable(self) -> None:
         self._run_control("emergency_disable")
 
+    @Slot(result=bool)
+    def restartAsAdmin(self) -> bool:
+        if self._is_elevated:
+            self._set_message("FocusOS is already running as administrator.", "info")
+            return False
+        script_path = str(Path(sys.argv[0]).resolve())
+        error = request_elevated_restart(
+            [script_path, *sys.argv[1:]],
+            os.getpid(),
+        )
+        if error:
+            self._set_message(error, "error" if "cancelled" not in error else "warn")
+            return False
+        self._set_message(
+            "Administrator restart requested. FocusOS will restore managed settings and close first.",
+            "info",
+        )
+        return True
+
     def _run_control(self, action: str) -> None:
         if self._control_pending or (self._closing and action != "stop"):
             return
@@ -385,6 +420,7 @@ class DashboardBackend(QObject):
 
         gpu = state.get("gpu_usage")
         warnings = state.get("resource_warnings") or []
+        focus_warning = state.get("focus_detection_warning")
         self._state = {
             "status": status,
             "cpu": float(state.get("cpu_usage", 0.0)),
@@ -396,11 +432,13 @@ class DashboardBackend(QObject):
             "focusMode": f"Mode: {state.get('focus_mode', 'idle')}",
             "focusScore": f"Focus score {int(state.get('focus_score', 0))}/100",
             "warningText": (
-                "Resource warnings: " + " ".join(str(item) for item in warnings)
-                if warnings
+                "Warnings: " + " ".join(
+                    [*(str(item) for item in warnings), *([str(focus_warning)] if focus_warning else [])]
+                )
+                if warnings or focus_warning
                 else "No active resource warnings."
             ),
-            "warningActive": bool(warnings),
+            "warningActive": bool(warnings or focus_warning),
             "summary": (
                 f"Processes: {int(state.get('active_processes', 0))} active  |  "
                 f"{int(state.get('background_processes', 0))} background  |  "
@@ -448,8 +486,13 @@ class DashboardBackend(QObject):
 
         errors = state.get("process_action_errors") or []
         if errors:
+            visible_errors = [str(error) for error in errors[:3]]
+            additional = len(errors) - len(visible_errors)
+            details = "; ".join(visible_errors)
+            if additional:
+                details += f"; and {additional} more process action warning(s)"
             self._set_message(
-                "Process action notes: " + "; ".join(str(error) for error in errors), "warn"
+                "Process action notes: " + details, "warn"
             )
         self.controlsChanged.emit()
 

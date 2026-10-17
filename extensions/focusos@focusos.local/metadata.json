@@ -1,0 +1,7 @@
+{
+  "uuid": "focusos@focusos.local",
+  "name": "FocusOS Active Window",
+  "description": "Provides the active window identity to the local FocusOS dashboard.",
+  "shell-version": ["45", "46", "47", "48", "49"],
+  "version": 1
+}

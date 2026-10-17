@@ -6,14 +6,21 @@ import ctypes
 import os
 import shutil
 import subprocess
+import sys
 from typing import Dict, List, Optional
 from ctypes import wintypes
 
 import psutil
 
+from core.gnome_focus import ensure_extension_enabled, get_active_window as get_gnome_active_window
+from core.gnome_focus import is_gnome_wayland
+
 
 class SystemMonitor:
     """Collect CPU, memory, process, and active-window information."""
+
+    _gnome_setup_checked = False
+    _gnome_setup_warning: Optional[str] = None
 
     def collect(self) -> Dict[str, object]:
         """Return a single current system snapshot."""
@@ -109,9 +116,11 @@ class SystemMonitor:
 
     @staticmethod
     def _get_active_window() -> Dict[str, object]:
-        """Read the foreground window using Windows APIs."""
+        """Read the foreground window using the supported desktop backend."""
+        if sys.platform.startswith("linux"):
+            return SystemMonitor._get_linux_active_window()
         if os.name != "nt":
-            raise OSError("Foreground-window detection is currently supported on Windows only.")
+            return {"application": None, "title": None, "pid": None}
 
         user32 = ctypes.windll.user32
         user32.GetForegroundWindow.restype = wintypes.HWND
@@ -146,3 +155,82 @@ class SystemMonitor:
             "title": title_buffer.value or None,
             "pid": pid,
         }
+
+    @staticmethod
+    def _get_linux_active_window() -> Dict[str, object]:
+        """Read X11 focus with xdotool; do not guess focus under Wayland."""
+        if os.environ.get("WAYLAND_DISPLAY") or os.environ.get("XDG_SESSION_TYPE") == "wayland":
+            if is_gnome_wayland():
+                if not SystemMonitor._gnome_setup_checked:
+                    SystemMonitor._gnome_setup_warning = ensure_extension_enabled()
+                    SystemMonitor._gnome_setup_checked = True
+                if SystemMonitor._gnome_setup_warning:
+                    return {
+                        "application": None,
+                        "title": None,
+                        "pid": None,
+                        "warning": SystemMonitor._gnome_setup_warning,
+                    }
+                return get_gnome_active_window()
+            return {
+                "application": None,
+                "title": None,
+                "pid": None,
+                "warning": "Active-window detection is unavailable in this Wayland session.",
+            }
+        if not os.environ.get("DISPLAY"):
+            return {
+                "application": None,
+                "title": None,
+                "pid": None,
+                "warning": "No X11 display was detected; active-window detection is unavailable.",
+            }
+
+        xdotool = shutil.which("xdotool")
+        if xdotool is None:
+            return {
+                "application": None,
+                "title": None,
+                "pid": None,
+                "warning": "Install xdotool to enable active-window detection in X11.",
+            }
+        try:
+            window_result = subprocess.run(
+                [xdotool, "getwindowfocus"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            window_id = window_result.stdout.strip()
+            if not window_id:
+                raise ValueError("xdotool returned an empty focused window ID")
+            pid_result = subprocess.run(
+                [xdotool, "getwindowpid", window_id],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            title_result = subprocess.run(
+                [xdotool, "getwindowname", window_id],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            pid = int(pid_result.stdout.strip())
+            process = psutil.Process(pid)
+            return {
+                "application": process.name(),
+                "title": title_result.stdout.strip() or None,
+                "pid": pid,
+                "warning": None,
+            }
+        except (OSError, ValueError, psutil.Error, subprocess.SubprocessError) as error:
+            return {
+                "application": None,
+                "title": None,
+                "pid": None,
+                "warning": f"Could not detect the active X11 window: {error}",
+            }

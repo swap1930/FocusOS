@@ -1,13 +1,13 @@
 # FocusOS
 
-FocusOS is a Windows desktop prototype for monitoring system resources and the
-currently focused application. The desktop interface uses PySide6 Qt Quick
-(QML), with Python providing the monitoring runtime and controls.
+FocusOS is a cross-platform desktop prototype for monitoring system resources
+and the currently focused application. The desktop interface uses PySide6 Qt
+Quick (QML), with Python providing the monitoring runtime and controls.
 
 ## Requirements
 
-- Windows
-- Python with `pip`
+- Windows or Linux
+- Python 3.10 or newer with `pip`
 
 ## Install and run
 
@@ -29,6 +29,46 @@ interpreter directly:
 .\venv\Scripts\python.exe main.py
 ```
 
+### Linux
+
+From a graphical Linux session, run the setup/launcher script:
+
+```bash
+bash scripts/run_focusos_linux.sh
+```
+
+It creates `.venv`, installs the Python requirements, and launches the
+dashboard. On X11, install `xdotool` for active-window detection (for example,
+`sudo apt install xdotool` on Ubuntu/Debian). On GNOME Wayland, FocusOS
+automatically installs and enables its active-window extension in the current
+user's GNOME extensions folder without root access. The extension reports the
+focused window's PID, application class, and title over the local user D-Bus
+session. Other Wayland desktops still need their own compositor-specific
+integration.
+
+On Linux, FocusOS detects the platform automatically, monitors resources, and
+uses reversible `SCHED_BATCH` scheduling for eligible current-user background
+processes; the original scheduling policy is restored when an app regains
+focus or monitoring pauses/stops. After two minutes it requests
+`process_madvise(MADV_PAGEOUT)` for up to 64 MiB of private mappings per
+process. This requires kernel pidfd/process-madvise support and ptrace access,
+so the kernel may deny the request; FocusOS reports the result rather than
+claiming RAM was freed. Protected system/desktop processes, other users'
+processes, FocusOS and its parent processes are excluded. X11 focus detection
+needs `xdotool`; GNOME Wayland uses the user extension described above. Other
+Wayland desktops report focus as unavailable, so automatic process controls
+remain inactive there. Explicitly allowlisted process suspend/resume is also
+supported. Windows-only disk cleanup commands remain Windows-only.
+
+Build a separate Linux executable with:
+
+```bash
+bash scripts/build_focusos_linux.sh
+```
+
+This produces a Linux binary under `dist/FocusOS`; a Windows `.exe` cannot run
+on Linux, so build a separate executable on each operating system.
+
 The default command opens the QML dashboard in light mode. Monitoring begins
 automatically and refreshes every two seconds. The dashboard displays CPU, RAM,
 disk, optional NVIDIA GPU usage, current focus, resource warnings, process
@@ -39,6 +79,19 @@ system scans do not block the interface.
 Use the dashboard buttons to start, pause, resume, stop, or emergency-disable
 FocusOS. The theme toggle switches between light and dark mode for the current
 session.
+
+While monitoring is running, automatic optimization raises the verified
+foreground app to Windows' above-normal priority and lowers eligible
+current-user background apps to below-normal priority. After two minutes in the
+background, FocusOS asks Windows to trim each eligible app's working set once.
+This can evict resident pages but does not transfer or guarantee RAM; Windows
+or the app may load those pages again. System/protected processes, processes
+owned by another user, FocusOS, and its parent processes are excluded. Pausing
+or stopping restores process priorities and resumes any explicitly allowlisted
+processes FocusOS suspended. If Windows denies changes to eligible apps, use
+the dashboard's **Restart as administrator** button and approve the UAC prompt.
+The elevated dashboard starts only after the current instance has shut down;
+Windows may still deny access to protected processes.
 
 ## `main.py` commands
 

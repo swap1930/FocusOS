@@ -13,6 +13,8 @@ from config.settings import (
     CLEANUP_DIAGNOSTIC_MIN_AGE_DAYS,
     CLEANUP_MIN_AGE_DAYS,
 )
+from core.elevation import wait_for_process_exit
+from core.platform_support import is_windows
 from core.storage_manager import StorageManager
 
 api = FocusAPI()
@@ -433,18 +435,35 @@ def main():
         action="store_true",
         help="launch the original terminal monitoring workflow instead of the desktop dashboard",
     )
+    parser.add_argument(
+        "--wait-for-process",
+        type=int,
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
 
+    if args.wait_for_process is not None:
+        try:
+            wait_for_process_exit(args.wait_for_process)
+        except RuntimeError as error:
+            parser.error(str(error))
+
     if args.cleanup_temp:
+        if not is_windows():
+            parser.error("--cleanup-temp is currently supported on Windows only.")
         cleanup_temp_files()
         return
     if args.cleanup_folders:
+        if not is_windows():
+            parser.error("--cleanup-folders is currently supported on Windows only.")
         cleanup_system_folders()
         return
     if args.manage_ram:
         manage_ram()
         return
     if args.optimize_disk:
+        if not is_windows():
+            parser.error("--optimize-disk is currently supported on Windows only.")
         optimize_disk()
         return
     if args.collect_python_garbage:
@@ -455,7 +474,7 @@ def main():
         run_desktop_dashboard()
         return
 
-    if not args.skip_disk_review:
+    if not args.skip_disk_review and is_windows():
         optimize_disk()
 
     api.runtime.start()
@@ -474,9 +493,17 @@ def main():
             + ". Background apps are suspended after two minutes."
         )
     else:
+        print("\nNo extra process-suspension allowlist is configured.")
+    if api.runtime.process_manager.auto_optimize_user_processes:
         print(
-            "\nNo process allowlist configured; FocusOS will monitor and recommend "
-            "without changing processes."
+            "Automatic optimization is enabled for eligible current-user apps: "
+            "the foreground app is prioritized, background apps are lowered, and "
+            "their working sets may be trimmed after two minutes."
+        )
+    elif getattr(api.runtime, "platform", "") == "Linux":
+        print(
+            "Linux monitoring is active; automatic priority and working-set changes "
+            "are disabled, but explicitly allowlisted apps can be suspended/resumed."
         )
     print("Press Ctrl+C to restore FocusOS-managed processes and stop.\n")
 

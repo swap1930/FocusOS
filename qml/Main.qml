@@ -142,7 +142,28 @@ ApplicationWindow {
                 AppButton { text: "Resume"; enabled: backend.canResume; onClicked: backend.resumeRuntime() }
                 AppButton { text: "Stop"; kind: "danger"; enabled: backend.canStop; onClicked: backend.stopRuntime() }
                 AppButton { text: "Emergency disable"; kind: "danger"; enabled: backend.canStop; onClicked: backend.emergencyDisable() }
+                AppButton {
+                    text: "Restart as administrator"
+                    visible: backend.supportsAdminRestart && !backend.isElevated
+                    enabled: backend.canStart || backend.canPause || backend.canResume || backend.canStop
+                    onClicked: {
+                        if (backend.restartAsAdmin())
+                            win.close()
+                    }
+                }
                 Item { Layout.fillWidth: true }
+            }
+
+            Text {
+                Layout.fillWidth: true
+                text: backend.supportsAdminRestart
+                    ? "Automatic optimization is enabled while running: eligible background apps get lower CPU priority and may have unused resident memory evicted after two minutes. RAM is not transferred; apps may reload pages."
+                    : backend.platformName === "Linux"
+                        ? "Linux applies reversible SCHED_BATCH scheduling to eligible background apps and requests kernel page-out after two minutes; the kernel may deny page-out, and RAM is not transferred. X11 needs xdotool; GNOME Wayland installs a user-level focus extension automatically."
+                        : "This operating system is not supported for process controls; monitoring may be limited."
+                color: Theme.muted
+                wrapMode: Text.Wrap
+                font.pixelSize: 11
             }
 
             // Metric cards
