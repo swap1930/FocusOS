@@ -9,6 +9,8 @@ from config.settings import (
     AUTO_OPTIMIZE_USER_PROCESSES,
     AUTO_SUSPEND_ALLOWLIST,
     AUTO_SUSPEND_DELAY_SECONDS,
+    RESOURCE_PROFILE_DEFAULT,
+    RESOURCE_PROFILES,
 )
 from core.focus_engine import FocusEngine
 from core.platform_support import is_linux, is_windows
@@ -44,6 +46,7 @@ class FocusOSState:
     priority_plan: Optional[List[Dict[str, object]]] = None
     top_memory_processes: List[Dict[str, object]] = field(default_factory=list)
     process_action_errors: List[str] = field(default_factory=list)
+    resource_profile: str = RESOURCE_PROFILE_DEFAULT
 
 
 class FocusRuntime:
@@ -70,8 +73,39 @@ class FocusRuntime:
         self.process_manager.auto_optimize_user_processes = (
             AUTO_OPTIMIZE_USER_PROCESSES and (is_windows() or is_linux())
         )
+        self.resource_profile = RESOURCE_PROFILE_DEFAULT
         self.platform = "Windows" if is_windows() else "Linux" if is_linux() else "Unsupported"
         self.state = FocusOSState()
+
+    def set_resource_profile(self, profile: str) -> Dict[str, object]:
+        """Switch resource policy after restoring settings from the previous profile."""
+        if profile not in RESOURCE_PROFILES:
+            raise ValueError(f"Unknown resource profile: {profile}")
+
+        restore_errors = self.process_manager.restore_all()
+        settings = RESOURCE_PROFILES[profile]
+        self.resource_profile = profile
+        self.process_manager.suspend_after_seconds = float(
+            settings["suspend_delay_seconds"]
+        )
+        self.resource_manager.set_warning_thresholds(
+            float(settings["cpu_warning"]),
+            float(settings["ram_warning"]),
+            float(settings["disk_warning"]),
+        )
+        self.state.resource_profile = profile
+        self.state.process_action_errors = restore_errors
+
+        if self.state.status in {"RUNNING", "PAUSED"}:
+            self.refresh()
+            self.state.process_action_errors = [
+                *restore_errors,
+                *self.state.process_action_errors,
+            ]
+        else:
+            self.state.suspended_processes = self.process_manager.suspended_count
+
+        return self.snapshot()
 
     def start(self) -> Dict[str, object]:
         """Start monitoring and return the first state snapshot."""

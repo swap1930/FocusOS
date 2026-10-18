@@ -51,6 +51,9 @@ ApplicationWindow {
     Connections {
         target: backend
         function onShutdownReady() { win.close() }
+        function onResourceProfileChanged() {
+            profileSelector.currentIndex = backend.resourceProfileIndex
+        }
         function onShutdownIssue(text) {
             win.issueText = text
             issuePopup.open()
@@ -154,12 +157,38 @@ ApplicationWindow {
                 Item { Layout.fillWidth: true }
             }
 
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+                Text {
+                    text: "Resource profile"
+                    color: Theme.text
+                    font.weight: Font.DemiBold
+                }
+                ComboBox {
+                    id: profileSelector
+                    model: backend.resourceProfiles
+                    textRole: "label"
+                    valueRole: "id"
+                    currentIndex: backend.resourceProfileIndex
+                    enabled: backend.canChangeResourceProfile
+                    onActivated: backend.setResourceProfile(currentValue)
+                }
+                Text {
+                    text: backend.resourceProfileDescription
+                    color: Theme.muted
+                    Layout.fillWidth: true
+                    wrapMode: Text.Wrap
+                    font.pixelSize: 11
+                }
+            }
+
             Text {
                 Layout.fillWidth: true
                 text: backend.supportsAdminRestart
-                    ? "Automatic optimization is enabled while running: eligible background apps get lower CPU priority and may have unused resident memory evicted after two minutes. RAM is not transferred; apps may reload pages."
+                    ? "Automatic optimization is enabled while running: the verified foreground app gets higher priority and eligible background apps get lower priority. The selected profile controls when FocusOS requests background memory cleanup; RAM is not transferred and apps may reload pages."
                     : backend.platformName === "Linux"
-                        ? "Linux applies reversible SCHED_BATCH scheduling to eligible background apps and requests kernel page-out after two minutes; the kernel may deny page-out, and RAM is not transferred. X11 needs xdotool; GNOME Wayland installs a user-level focus extension automatically."
+                        ? "Linux applies reversible SCHED_BATCH scheduling to eligible background apps and requests kernel page-out according to the selected profile; the kernel may deny page-out, and RAM is not transferred. X11 needs xdotool; GNOME Wayland installs a user-level focus extension automatically."
                         : "This operating system is not supported for process controls; monitoring may be limited."
                 color: Theme.muted
                 wrapMode: Text.Wrap

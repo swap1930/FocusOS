@@ -16,6 +16,7 @@ from config.settings import (
     AUTO_OPTIMIZE_USER_PROCESSES,
     AUTO_SUSPEND_DELAY_SECONDS,
     CLEANUP_AUTO_MIN_AGE_SECONDS,
+    RESOURCE_PROFILES,
 )
 from core import elevation, gnome_focus, process_manager as process_manager_module
 from core.focus_engine import FocusEngine
@@ -194,6 +195,64 @@ def test_configured_process_suspension_delay_is_two_minutes():
 
     assert AUTO_SUSPEND_DELAY_SECONDS == 120
     assert runtime.process_manager.suspend_after_seconds == 120
+
+
+def test_resource_profiles_update_policy_thresholds_and_restore_managed_settings():
+    class ProfileProcessManager:
+        auto_optimize_user_processes = False
+        suspend_after_seconds = AUTO_SUSPEND_DELAY_SECONDS
+        suspended_count = 0
+        working_set_trimmed_bytes = 0
+        action_errors = []
+
+        def __init__(self):
+            self.restore_calls = 0
+
+        def restore_all(self):
+            self.restore_calls += 1
+            return []
+
+        def build_priority_plan(self, processes, focus_pid, apply_controls=True):
+            return []
+
+    process_manager = ProfileProcessManager()
+    runtime = FocusRuntime(
+        monitor=FakeMonitor(),
+        process_manager=process_manager,
+    )
+    runtime.start()
+
+    focus_state = runtime.set_resource_profile("focus")
+    assert focus_state["resource_profile"] == "focus"
+    assert process_manager.suspend_after_seconds == 60
+    assert runtime.resource_manager.assess(70, 0, 0)["status"] == "WARNING"
+
+    performance_state = runtime.set_resource_profile("performance")
+    assert performance_state["resource_profile"] == "performance"
+    assert process_manager.suspend_after_seconds == 300
+    assert runtime.resource_manager.assess(89, 89, 94)["status"] == "NORMAL"
+    assert process_manager.restore_calls == 2
+
+    balanced_state = runtime.set_resource_profile("balanced")
+    assert balanced_state["resource_profile"] == "balanced"
+    assert process_manager.suspend_after_seconds == AUTO_SUSPEND_DELAY_SECONDS
+    assert runtime.resource_manager.assess(80, 0, 0)["status"] == "WARNING"
+
+
+def test_resource_profile_thresholds_are_validated():
+    manager = ResourceManager()
+
+    with pytest.raises(ValueError, match="between 0 and 100"):
+        manager.set_warning_thresholds(101, 85, 90)
+
+
+def test_unknown_resource_profile_is_rejected():
+    runtime = FocusRuntime(monitor=FakeMonitor())
+
+    with pytest.raises(ValueError, match="Unknown resource profile"):
+        runtime.set_resource_profile("turbo")
+
+    assert set(RESOURCE_PROFILES) == {"focus", "balanced", "performance"}
 
 
 def test_main_launches_desktop_dashboard_by_default(monkeypatch):

@@ -28,6 +28,7 @@ from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 
+from config.settings import RESOURCE_PROFILES
 from core.elevation import is_user_admin, request_elevated_restart
 from core.focus_runtime import FocusRuntime
 from core.platform_support import supports_admin_restart
@@ -147,6 +148,15 @@ class DashboardWorker(QObject):
             return
         self.operation_completed.emit(action, state, "")
 
+    @Slot(str)
+    def set_resource_profile(self, profile: str) -> None:
+        try:
+            state = self.runtime.set_resource_profile(profile)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self.operation_completed.emit(f"profile:{profile}", None, str(error))
+            return
+        self.operation_completed.emit(f"profile:{profile}", state, "")
+
 
 def _format_bytes(value: Any) -> str:
     size = float(value or 0)
@@ -171,6 +181,7 @@ def _default_state() -> Dict[str, Any]:
         "warningText": "No active resource warnings.",
         "warningActive": False,
         "summary": "",
+        "resourceProfile": RESOURCE_PROFILES["balanced"]["label"],
     }
 
 
@@ -181,11 +192,13 @@ class DashboardBackend(QObject):
     historyChanged = Signal()
     messageChanged = Signal()
     controlsChanged = Signal()
+    resourceProfileChanged = Signal()
     darkModeChanged = Signal()
     shutdownIssue = Signal(str)
     shutdownReady = Signal()
     request_refresh = Signal()
     request_control = Signal(str)
+    request_resource_profile = Signal(str)
 
     def __init__(self, runtime: Optional[FocusRuntime] = None):
         super().__init__()
@@ -197,6 +210,8 @@ class DashboardBackend(QObject):
         self._message_kind = ""
         self._refresh_pending = False
         self._control_pending = False
+        self._profile_pending = False
+        self._resource_profile = self.runtime.resource_profile
         self._closing = False
         self._shutdown_complete = False
         self._is_elevated = is_user_admin()
@@ -211,6 +226,7 @@ class DashboardBackend(QObject):
         self.worker.moveToThread(self.worker_thread)
         self.request_refresh.connect(self.worker.refresh)
         self.request_control.connect(self.worker.run_control)
+        self.request_resource_profile.connect(self.worker.set_resource_profile)
         self.worker.operation_completed.connect(self._handle_operation_completed)
         self.worker_thread.finished.connect(self.worker.deleteLater)
         self.worker_thread.start()
@@ -260,6 +276,29 @@ class DashboardBackend(QObject):
     def platformName(self) -> str:
         return self.runtime.platform
 
+    @Property("QVariantList", constant=True)  # type: ignore[arg-type]
+    def resourceProfiles(self) -> List[Dict[str, str]]:
+        return [
+            {"id": profile_id, "label": str(settings["label"])}
+            for profile_id, settings in RESOURCE_PROFILES.items()
+        ]
+
+    @Property(str, notify=resourceProfileChanged)
+    def resourceProfile(self) -> str:
+        return self._resource_profile
+
+    @Property(int, notify=resourceProfileChanged)
+    def resourceProfileIndex(self) -> int:
+        return list(RESOURCE_PROFILES).index(self._resource_profile)
+
+    @Property(str, notify=resourceProfileChanged)
+    def resourceProfileDescription(self) -> str:
+        return str(RESOURCE_PROFILES[self._resource_profile]["description"])
+
+    @Property(bool, notify=controlsChanged)
+    def canChangeResourceProfile(self) -> bool:
+        return self._controls_enabled() and not self._profile_pending
+
     @Property(bool, notify=controlsChanged)
     def canStart(self) -> bool:
         return self._controls_enabled() and self._status == "STOPPED"
@@ -277,7 +316,7 @@ class DashboardBackend(QObject):
         return self._controls_enabled() and self._status in {"RUNNING", "PAUSED"}
 
     def _controls_enabled(self) -> bool:
-        return not self._control_pending and not self._closing
+        return not self._control_pending and not self._profile_pending and not self._closing
 
     # ----------------------------------------------------------------- theme --
     @Slot()
@@ -336,6 +375,20 @@ class DashboardBackend(QObject):
     def emergencyDisable(self) -> None:
         self._run_control("emergency_disable")
 
+    @Slot(str)
+    def setResourceProfile(self, profile: str) -> None:
+        if profile not in RESOURCE_PROFILES:
+            self._set_message(f"Unknown resource profile: {profile}", "error")
+            return
+        if self._control_pending or self._profile_pending or self._closing:
+            return
+        if profile == self._resource_profile:
+            return
+        self._profile_pending = True
+        self.controlsChanged.emit()
+        self._set_message("Applying resource profile...", "info")
+        self.request_resource_profile.emit(profile)
+
     @Slot(result=bool)
     def restartAsAdmin(self) -> bool:
         if self._is_elevated:
@@ -356,7 +409,11 @@ class DashboardBackend(QObject):
         return True
 
     def _run_control(self, action: str) -> None:
-        if self._control_pending or (self._closing and action != "stop"):
+        if (
+            self._control_pending
+            or self._profile_pending
+            or (self._closing and action != "stop")
+        ):
             return
         self._control_pending = True
         self.controlsChanged.emit()
@@ -365,7 +422,12 @@ class DashboardBackend(QObject):
 
     def refresh_dashboard(self) -> None:
         """Request one background refresh without queuing overlapping polls."""
-        if self._refresh_pending or self._control_pending or self._closing:
+        if (
+            self._refresh_pending
+            or self._control_pending
+            or self._profile_pending
+            or self._closing
+        ):
             return
         self._refresh_pending = True
         self.request_refresh.emit()
@@ -382,11 +444,20 @@ class DashboardBackend(QObject):
     def _handle_operation_completed(self, action: str, state: object, error: str) -> None:
         if action == "refresh":
             self._refresh_pending = False
+        elif action.startswith("profile:"):
+            self._profile_pending = False
+            self.resourceProfileChanged.emit()
         else:
             self._control_pending = False
 
         if error:
-            prefix = "Monitoring error" if action == "refresh" else "Action error"
+            prefix = (
+                "Monitoring error"
+                if action == "refresh"
+                else "Profile error"
+                if action.startswith("profile:")
+                else "Action error"
+            )
             self._set_message(f"{prefix}: {error}", "error")
         elif isinstance(state, dict):
             self._set_message("", "")
@@ -417,12 +488,23 @@ class DashboardBackend(QObject):
     def update_dashboard(self, state: Dict[str, Any]) -> None:
         status = str(state.get("status", "STOPPED"))
         self._status = status
+        resource_profile = str(
+            state.get("resource_profile", self._resource_profile)
+        )
+        if resource_profile in RESOURCE_PROFILES and resource_profile != self._resource_profile:
+            self._resource_profile = resource_profile
+            self.resourceProfileChanged.emit()
 
         gpu = state.get("gpu_usage")
         warnings = state.get("resource_warnings") or []
         focus_warning = state.get("focus_detection_warning")
         self._state = {
             "status": status,
+            "resourceProfile": str(
+                RESOURCE_PROFILES[resource_profile]["label"]
+                if resource_profile in RESOURCE_PROFILES
+                else resource_profile
+            ),
             "cpu": float(state.get("cpu_usage", 0.0)),
             "ram": float(state.get("ram_usage", 0.0)),
             "disk": float(state.get("disk_usage", 0.0)),

@@ -19,6 +19,20 @@ class ResourceManager:
         self.disk_warning = disk_warning
         self.critical_threshold = critical_threshold
 
+    def set_warning_thresholds(
+        self,
+        cpu_warning: float,
+        ram_warning: float,
+        disk_warning: float,
+    ) -> None:
+        """Update the warning thresholds used by the selected resource profile."""
+        thresholds = (cpu_warning, ram_warning, disk_warning)
+        if any(not 0 <= value <= 100 for value in thresholds):
+            raise ValueError("Resource warning thresholds must be between 0 and 100.")
+        self.cpu_warning, self.ram_warning, self.disk_warning = thresholds
+        self.cpu_limit = cpu_warning
+        self.ram_limit = ram_warning
+
     def assess(self, cpu_usage: float, ram_usage: float, disk_usage: float) -> Dict[str, object]:
         """Report pressure without taking destructive or unapproved actions."""
         metrics = {

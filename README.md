@@ -49,7 +49,7 @@ integration.
 On Linux, FocusOS detects the platform automatically, monitors resources, and
 uses reversible `SCHED_BATCH` scheduling for eligible current-user background
 processes; the original scheduling policy is restored when an app regains
-focus or monitoring pauses/stops. After two minutes it requests
+focus or monitoring pauses/stops. The selected profile sets the delay before it requests
 `process_madvise(MADV_PAGEOUT)` for up to 64 MiB of private mappings per
 process. This requires kernel pidfd/process-madvise support and ptrace access,
 so the kernel may deny the request; FocusOS reports the result rather than
@@ -80,10 +80,20 @@ Use the dashboard buttons to start, pause, resume, stop, or emergency-disable
 FocusOS. The theme toggle switches between light and dark mode for the current
 session.
 
+Choose a resource profile in the dashboard: **Focus** requests background
+memory cleanup after one minute and uses lower CPU/RAM warning thresholds;
+**Balanced** keeps the existing two-minute policy; **Performance** waits five
+minutes and uses higher warning thresholds. These are policy and warning
+thresholds, not hard CPU/RAM caps. Switching profiles first restores process
+settings managed by the previous profile; normal safety checks and restoration
+still apply.
+
 While monitoring is running, automatic optimization raises the verified
 foreground app to Windows' above-normal priority and lowers eligible
 current-user background apps to below-normal priority. After two minutes in the
-background, FocusOS asks Windows to trim each eligible app's working set once.
+background under the default Balanced profile, FocusOS asks Windows to trim
+each eligible app's working set once. Focus and Performance profiles use their
+own delays.
 This can evict resident pages but does not transfer or guarantee RAM; Windows
 or the app may load those pages again. System/protected processes, processes
 owned by another user, FocusOS, and its parent processes are excluded. Pausing
