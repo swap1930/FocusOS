@@ -51,9 +51,6 @@ ApplicationWindow {
     Connections {
         target: backend
         function onShutdownReady() { win.close() }
-        function onResourceProfileChanged() {
-            profileSelector.currentIndex = backend.resourceProfileIndex
-        }
         function onShutdownIssue(text) {
             win.issueText = text
             issuePopup.open()
@@ -145,6 +142,7 @@ ApplicationWindow {
                 AppButton { text: "Resume"; enabled: backend.canResume; onClicked: backend.resumeRuntime() }
                 AppButton { text: "Stop"; kind: "danger"; enabled: backend.canStop; onClicked: backend.stopRuntime() }
                 AppButton { text: "Emergency disable"; kind: "danger"; enabled: backend.canStop; onClicked: backend.emergencyDisable() }
+                AppButton { text: "Clean disk"; enabled: backend.canCleanDisk; onClicked: backend.cleanDisk() }
                 AppButton {
                     text: "Restart as administrator"
                     visible: backend.supportsAdminRestart && !backend.isElevated
@@ -159,20 +157,52 @@ ApplicationWindow {
 
             RowLayout {
                 Layout.fillWidth: true
-                spacing: 10
+                spacing: 12
                 Text {
-                    text: "Resource profile"
+                    text: "Resource policy"
                     color: Theme.text
                     font.weight: Font.DemiBold
                 }
-                ComboBox {
-                    id: profileSelector
-                    model: backend.resourceProfiles
-                    textRole: "label"
-                    valueRole: "id"
-                    currentIndex: backend.resourceProfileIndex
-                    enabled: backend.canChangeResourceProfile
-                    onActivated: backend.setResourceProfile(currentValue)
+                Rectangle {
+                    implicitWidth: autoProfileLabel.implicitWidth + 24
+                    implicitHeight: 26
+                    radius: height / 2
+                    color: backend.resourceProfile === "focus" ? Theme.greenBg
+                         : backend.resourceProfile === "performance" ? Theme.amberBg
+                         : Theme.button
+                    border.width: 1
+                    border.color: backend.resourceProfile === "focus" ? Theme.greenBorder
+                                : backend.resourceProfile === "performance" ? Theme.amberBorder
+                                : Theme.borderStrong
+
+                    Text {
+                        id: autoProfileLabel
+                        anchors.centerIn: parent
+                        text: "Auto: " + backend.state.resourceProfile
+                        font.pixelSize: 12
+                        font.weight: Font.Bold
+                        color: backend.resourceProfile === "focus" ? Theme.green
+                             : backend.resourceProfile === "performance" ? Theme.amber
+                             : Theme.text
+                    }
+                }
+                // ML Power Mode badge – shown only when ML/AI training is detected
+                Rectangle {
+                    implicitWidth: mlPowerLabel.implicitWidth + 24
+                    implicitHeight: 26
+                    radius: height / 2
+                    visible: backend.state.mlPowerModeActive === true
+                    color: "#3d1a6e"
+                    border.width: 1
+                    border.color: "#9b59b6"
+                    Text {
+                        id: mlPowerLabel
+                        anchors.centerIn: parent
+                        text: "\u26a1 ML Power Mode"
+                        font.pixelSize: 12
+                        font.weight: Font.Bold
+                        color: "#d7a8ff"
+                    }
                 }
                 Text {
                     text: backend.resourceProfileDescription
@@ -186,9 +216,9 @@ ApplicationWindow {
             Text {
                 Layout.fillWidth: true
                 text: backend.supportsAdminRestart
-                    ? "Automatic optimization is enabled while running: the verified foreground app gets higher priority and eligible background apps get lower priority. The selected profile controls when FocusOS requests background memory cleanup; RAM is not transferred and apps may reload pages."
+                    ? "Automatic optimization is active while running: FocusOS detects your active tab and application to automatically adjust background memory cleanup and process priority. The active app gets higher priority while unused background apps are trimmed automatically; RAM is not transferred and apps may reload pages."
                     : backend.platformName === "Linux"
-                        ? "Linux applies reversible SCHED_BATCH scheduling to eligible background apps and requests kernel page-out according to the selected profile; the kernel may deny page-out, and RAM is not transferred. X11 needs xdotool; GNOME Wayland installs a user-level focus extension automatically."
+                        ? "Linux applies reversible SCHED_BATCH scheduling to eligible background apps and requests kernel page-out based on the active tab and task; the kernel may deny page-out, and RAM is not transferred. X11 needs xdotool; GNOME Wayland installs a user-level focus extension automatically."
                         : "This operating system is not supported for process controls; monitoring may be limited."
                 color: Theme.muted
                 wrapMode: Text.Wrap

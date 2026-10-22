@@ -73,6 +73,9 @@ class ProcessManager:
         self.allowlist = {os.path.basename(name).casefold() for name in allowlist}
         self.suspend_after_seconds = suspend_after_seconds
         self.auto_optimize_user_processes = False
+        # When True the focused process is boosted to HIGH_PRIORITY_CLASS instead
+        # of the default ABOVE_NORMAL_PRIORITY_CLASS – activated by ML Power Mode.
+        self.ml_power_mode = False
         self._clock = clock
         self._process_factory = process_factory
         self._active_pid_provider = active_pid_provider
@@ -202,8 +205,13 @@ class ProcessManager:
                     self._trimmed_instances.discard(identity)
                     action_error = self._resume(identity) or action_error
                     action_error = self._restore_priority(identity) or action_error
+                    boost_class = (
+                        psutil.HIGH_PRIORITY_CLASS
+                        if self.ml_power_mode
+                        else psutil.ABOVE_NORMAL_PRIORITY_CLASS
+                    )
                     action_error = self._boost_priority(
-                        identity, pid, psutil.ABOVE_NORMAL_PRIORITY_CLASS
+                        identity, pid, boost_class
                     ) or action_error
                 elif is_windows():
                     action_error = self._restore_priority(identity) or action_error

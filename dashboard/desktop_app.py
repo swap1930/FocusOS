@@ -542,6 +542,7 @@ class DashboardWorker(QObject):
             "resume": self.runtime.resume,
             "stop": self.runtime.stop,
             "emergency_disable": self.runtime.emergency_disable,
+            "clean_disk": self.runtime.clean_disk,
         }
         try:
             state = actions[action]()
@@ -651,12 +652,14 @@ class DashboardWindow(QMainWindow):
         self.stop_button.setObjectName("dangerButton")
         self.emergency_button = QPushButton("Emergency disable")
         self.emergency_button.setObjectName("dangerButton")
+        self.clean_disk_button = QPushButton("Clean disk")
         for button, action in (
             (self.start_button, self.start_runtime),
             (self.pause_button, self.pause_runtime),
             (self.resume_button, self.resume_runtime),
             (self.stop_button, self.stop_runtime),
             (self.emergency_button, self.emergency_disable),
+            (self.clean_disk_button, self.clean_disk),
         ):
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.clicked.connect(action)
@@ -692,10 +695,13 @@ class DashboardWindow(QMainWindow):
         focus_title.setObjectName("metricName")
         focus_head.addWidget(focus_title)
         focus_head.addStretch()
+        self.policy_label = QLabel("Auto: Balanced")
+        self.policy_label.setObjectName("chip")
         self.mode_label = QLabel("")
         self.mode_label.setObjectName("chip")
         self.score_label = QLabel("")
         self.score_label.setObjectName("chip")
+        focus_head.addWidget(self.policy_label)
         focus_head.addWidget(self.mode_label)
         focus_head.addWidget(self.score_label)
 
@@ -866,6 +872,8 @@ class DashboardWindow(QMainWindow):
         self.window_label.setText(f"Window: {state.get('focus_window') or 'Unknown'}")
         self.mode_label.setText(f"Mode: {state.get('focus_mode', 'idle')}")
         self.score_label.setText(f"Focus score {int(state.get('focus_score', 0))}/100")
+        profile = str(state.get("resource_profile") or "balanced").capitalize()
+        self.policy_label.setText(f"Auto: {profile}")
 
         warnings = state.get("resource_warnings") or []
         self._warning_active = bool(warnings)
@@ -980,6 +988,7 @@ class DashboardWindow(QMainWindow):
         can_stop = enabled and self._status in {"RUNNING", "PAUSED"}
         self.stop_button.setEnabled(can_stop)
         self.emergency_button.setEnabled(can_stop)
+        self.clean_disk_button.setEnabled(enabled)
 
     def _run_control(self, action: str) -> None:
         if self._control_pending or (self._closing and action != "stop"):
@@ -1002,7 +1011,11 @@ class DashboardWindow(QMainWindow):
             prefix = "Monitoring error" if action == "refresh" else "Action error"
             self._set_message(f"{prefix}: {error}", "error")
         elif isinstance(state, dict):
-            self._set_message("", "")
+            if action == "clean_disk":
+                summary = str(state.get("last_disk_cleanup_summary") or "Disk cleanup complete.")
+                self._set_message(summary, "info")
+            else:
+                self._set_message("", "")
             self.update_dashboard(state)
 
         if self._closing:
@@ -1044,6 +1057,9 @@ class DashboardWindow(QMainWindow):
 
     def emergency_disable(self) -> None:
         self._run_control("emergency_disable")
+
+    def clean_disk(self) -> None:
+        self._run_control("clean_disk")
 
     def closeEvent(self, event: Any) -> None:
         if not self._shutdown_complete:

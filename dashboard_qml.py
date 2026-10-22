@@ -157,6 +157,16 @@ class DashboardWorker(QObject):
             return
         self.operation_completed.emit(f"profile:{profile}", state, "")
 
+    @Slot()
+    def clean_disk(self) -> None:
+        try:
+            self.runtime.clean_disk(empty_recycle_bin=False)
+            state = self.runtime.snapshot()
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self.operation_completed.emit("clean_disk", None, str(error))
+            return
+        self.operation_completed.emit("clean_disk", state, "")
+
 
 def _format_bytes(value: Any) -> str:
     size = float(value or 0)
@@ -182,6 +192,8 @@ def _default_state() -> Dict[str, Any]:
         "warningActive": False,
         "summary": "",
         "resourceProfile": RESOURCE_PROFILES["balanced"]["label"],
+        "diskCleaned": "0.0 B",
+        "diskCleanedSummary": "",
     }
 
 
@@ -199,6 +211,7 @@ class DashboardBackend(QObject):
     request_refresh = Signal()
     request_control = Signal(str)
     request_resource_profile = Signal(str)
+    request_clean_disk = Signal()
 
     def __init__(self, runtime: Optional[FocusRuntime] = None):
         super().__init__()
@@ -211,6 +224,7 @@ class DashboardBackend(QObject):
         self._refresh_pending = False
         self._control_pending = False
         self._profile_pending = False
+        self._disk_cleaning = False
         self._resource_profile = self.runtime.resource_profile
         self._closing = False
         self._shutdown_complete = False
@@ -227,6 +241,7 @@ class DashboardBackend(QObject):
         self.request_refresh.connect(self.worker.refresh)
         self.request_control.connect(self.worker.run_control)
         self.request_resource_profile.connect(self.worker.set_resource_profile)
+        self.request_clean_disk.connect(self.worker.clean_disk)
         self.worker.operation_completed.connect(self._handle_operation_completed)
         self.worker_thread.finished.connect(self.worker.deleteLater)
         self.worker_thread.start()
@@ -315,6 +330,10 @@ class DashboardBackend(QObject):
     def canStop(self) -> bool:
         return self._controls_enabled() and self._status in {"RUNNING", "PAUSED"}
 
+    @Property(bool, notify=controlsChanged)
+    def canCleanDisk(self) -> bool:
+        return not self._disk_cleaning and not self._closing
+
     def _controls_enabled(self) -> bool:
         return not self._control_pending and not self._profile_pending and not self._closing
 
@@ -389,6 +408,15 @@ class DashboardBackend(QObject):
         self._set_message("Applying resource profile...", "info")
         self.request_resource_profile.emit(profile)
 
+    @Slot()
+    def cleanDisk(self) -> None:
+        if self._disk_cleaning or self._closing:
+            return
+        self._disk_cleaning = True
+        self.controlsChanged.emit()
+        self._set_message("Scanning and cleaning temporary files...", "info")
+        self.request_clean_disk.emit()
+
     @Slot(result=bool)
     def restartAsAdmin(self) -> bool:
         if self._is_elevated:
@@ -442,6 +470,17 @@ class DashboardBackend(QObject):
     # ----------------------------------------------------------------- updates --
     @Slot(str, object, str)
     def _handle_operation_completed(self, action: str, state: object, error: str) -> None:
+        if action == "clean_disk":
+            self._disk_cleaning = False
+            self.controlsChanged.emit()
+            if error:
+                self._set_message(f"Disk cleanup error: {error}", "error")
+            elif isinstance(state, dict):
+                summary = str(state.get("last_disk_cleanup_summary") or "Disk cleanup complete.")
+                self._set_message(summary, "info")
+                self.update_dashboard(state)
+            return
+
         if action == "refresh":
             self._refresh_pending = False
         elif action.startswith("profile:"):
@@ -508,6 +547,8 @@ class DashboardBackend(QObject):
             "cpu": float(state.get("cpu_usage", 0.0)),
             "ram": float(state.get("ram_usage", 0.0)),
             "disk": float(state.get("disk_usage", 0.0)),
+            "diskCleaned": _format_bytes(state.get("disk_cleaned_bytes", 0)),
+            "diskCleanedSummary": str(state.get("last_disk_cleanup_summary") or ""),
             "gpu": -1.0 if gpu is None else float(gpu),
             "focusApp": str(state.get("focus_application") or "Unknown application"),
             "focusWindow": f"Window: {state.get('focus_window') or 'Unknown'}",
@@ -521,6 +562,7 @@ class DashboardBackend(QObject):
                 else "No active resource warnings."
             ),
             "warningActive": bool(warnings or focus_warning),
+            "mlPowerModeActive": bool(state.get("ml_power_mode_active", False)),
             "summary": (
                 f"Processes: {int(state.get('active_processes', 0))} active  |  "
                 f"{int(state.get('background_processes', 0))} background  |  "

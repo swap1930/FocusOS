@@ -80,20 +80,24 @@ Use the dashboard buttons to start, pause, resume, stop, or emergency-disable
 FocusOS. The theme toggle switches between light and dark mode for the current
 session.
 
-Choose a resource profile in the dashboard: **Focus** requests background
-memory cleanup after one minute and uses lower CPU/RAM warning thresholds;
-**Balanced** keeps the existing two-minute policy; **Performance** waits five
-minutes and uses higher warning thresholds. These are policy and warning
-thresholds, not hard CPU/RAM caps. Switching profiles first restores process
-settings managed by the previous profile; normal safety checks and restoration
-still apply.
+FocusOS automatically tunes resource policies based on the active tab and
+application window:
+- **Focus**: automatically activates during coding, meetings, AI/ML study, or
+  focused work (e.g., VS Code, GitHub, LeetCode, Stack Overflow, Colab, Google
+  Meet). It requests background memory cleanup after 1 minute and uses tighter
+  warning thresholds (CPU 70%, RAM 75%, disk 90%).
+- **Balanced**: automatically activates for general web browsing and casual tasks
+  (e.g., YouTube, Reddit, social media, idle browsing). It applies background
+  memory cleanup after 2 minutes with standard thresholds (CPU 80%, RAM 85%, disk 90%).
+- **Performance**: automatically activates for heavy creative workloads and rendering
+  (e.g., Figma, Canva, Blender, 3D rendering). It uses a relaxed 5-minute cleanup
+  delay and higher warning thresholds (CPU 90%, RAM 90%, disk 95%).
 
 While monitoring is running, automatic optimization raises the verified
 foreground app to Windows' above-normal priority and lowers eligible
-current-user background apps to below-normal priority. After two minutes in the
-background under the default Balanced profile, FocusOS asks Windows to trim
-each eligible app's working set once. Focus and Performance profiles use their
-own delays.
+current-user background apps to below-normal priority. Once the delay configured
+by the active profile expires, FocusOS asks Windows to trim each eligible app's
+working set once.
 This can evict resident pages but does not transfer or guarantee RAM; Windows
 or the app may load those pages again. System/protected processes, processes
 owned by another user, FocusOS, and its parent processes are excluded. Pausing

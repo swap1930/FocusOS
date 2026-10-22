@@ -255,6 +255,93 @@ def test_unknown_resource_profile_is_rejected():
     assert set(RESOURCE_PROFILES) == {"focus", "balanced", "performance"}
 
 
+def test_focus_engine_detects_specific_browser_tabs():
+    engine = FocusEngine()
+
+    assert engine.classify_task("chrome.exe", "swap1930/FocusOS · Pull requests · GitHub") == "coding"
+    assert engine.classify_task("msedge.exe", "Two Sum - LeetCode") == "coding"
+    assert engine.classify_task("firefox.exe", "Python AsyncIO - Stack Overflow") == "coding"
+    assert engine.classify_task("chrome.exe", "train_model.ipynb - Google Colab") == "ml_training"
+    assert engine.classify_task("chrome.exe", "ChatGPT - OpenAI") == "ml_training"
+    assert engine.classify_task("chrome.exe", "Google Meet - Team Sync") == "communication"
+    assert engine.classify_task("chrome.exe", "Figma - Mobile UI Prototype") == "rendering"
+    assert engine.classify_task("chrome.exe", "Google Docs - Q3 Roadmap") == "presentation"
+    assert engine.classify_task("chrome.exe", "lofi hip hop radio - YouTube") == "browsing"
+    assert engine.classify_task("chrome.exe", "New Tab") == "browsing"
+
+
+def test_runtime_automatically_switches_profile_based_on_tab_and_app():
+    class DynamicTabMonitor:
+        def __init__(self):
+            self.active_window = {"application": "chrome.exe", "title": "GitHub - swap1930/FocusOS", "pid": 100}
+
+        def collect(self):
+            return {
+                "cpu_usage": 20.0,
+                "ram_usage": 30.0,
+                "gpu_usage": None,
+                "active_window": self.active_window,
+                "processes": [
+                    {"pid": 100, "name": "chrome.exe", "cpu_percent": 10.0, "memory_rss": 50 * 1024 * 1024},
+                ],
+            }
+
+    class SimpleProcessManager:
+        auto_optimize_user_processes = False
+        suspend_after_seconds = AUTO_SUSPEND_DELAY_SECONDS
+        suspended_count = 0
+        working_set_trimmed_bytes = 0
+        action_errors = []
+
+        def build_priority_plan(self, processes, focus_pid, apply_controls=True):
+            return []
+
+        def restore_all(self):
+            return []
+
+    monitor = DynamicTabMonitor()
+    process_manager = SimpleProcessManager()
+    runtime = FocusRuntime(monitor=monitor, process_manager=process_manager)
+
+    # 1. On GitHub tab in Chrome -> automatically sets "focus" profile (60s suspend delay)
+    state = runtime.start()
+    assert state["focus_mode"] == "coding"
+    assert state["resource_profile"] == "focus"
+    assert process_manager.suspend_after_seconds == 60
+    assert runtime.resource_manager.assess(70, 0, 0)["status"] == "WARNING"
+
+    # 2. Switch to Figma (design/rendering) tab -> automatically sets "performance" profile (300s suspend delay)
+    monitor.active_window = {"application": "chrome.exe", "title": "Figma - App Mockup", "pid": 100}
+    state = runtime.refresh()
+    assert state["focus_mode"] == "rendering"
+    assert state["resource_profile"] == "performance"
+    assert process_manager.suspend_after_seconds == 300
+    assert runtime.resource_manager.assess(80, 80, 90)["status"] == "NORMAL"
+
+    # 3. Switch to YouTube (general browsing/media) tab -> automatically sets "balanced" profile (120s delay)
+    monitor.active_window = {"application": "chrome.exe", "title": "YouTube - Music Video", "pid": 100}
+    state = runtime.refresh()
+    assert state["focus_mode"] == "browsing"
+    assert state["resource_profile"] == "balanced"
+    assert process_manager.suspend_after_seconds == AUTO_SUSPEND_DELAY_SECONDS
+    assert runtime.resource_manager.assess(80, 0, 0)["status"] == "WARNING"
+
+    # 4. Manual override locks profile; re-enabling auto restores dynamic tuning
+    runtime.set_resource_profile("focus")
+    assert runtime.state.resource_profile == "focus"
+    assert not runtime.state.auto_resource_profile
+
+    # While locked, refresh with YouTube does not override the manual choice
+    state = runtime.refresh()
+    assert state["resource_profile"] == "focus"
+
+    # Re-enabling auto resumes dynamic tuning
+    runtime.enable_auto_resource_profile()
+    state = runtime.refresh()
+    assert state["resource_profile"] == "balanced"
+    assert state["auto_resource_profile"]
+
+
 def test_main_launches_desktop_dashboard_by_default(monkeypatch):
     calls = []
     monkeypatch.setattr("sys.argv", ["main.py"])

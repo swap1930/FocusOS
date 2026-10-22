@@ -9,13 +9,16 @@ from config.settings import (
     AUTO_OPTIMIZE_USER_PROCESSES,
     AUTO_SUSPEND_ALLOWLIST,
     AUTO_SUSPEND_DELAY_SECONDS,
+    ML_POWER_MODE_SUSPEND_DELAY,
     RESOURCE_PROFILE_DEFAULT,
     RESOURCE_PROFILES,
+    TASK_PROFILE_MAP,
 )
 from core.focus_engine import FocusEngine
 from core.platform_support import is_linux, is_windows
 from core.process_manager import ProcessManager
 from core.resource_manager import ResourceManager
+from core.storage_manager import StorageManager
 from core.system_monitor import SystemMonitor
 
 
@@ -36,6 +39,8 @@ class FocusOSState:
     disk_usage: float = 0.0
     disk_free_bytes: int = 0
     disk_total_bytes: int = 0
+    disk_cleaned_bytes: int = 0
+    last_disk_cleanup_summary: Optional[str] = None
     gpu_usage: Optional[float] = None
     resource_status: str = "NORMAL"
     resource_warnings: List[str] = field(default_factory=list)
@@ -47,6 +52,8 @@ class FocusOSState:
     top_memory_processes: List[Dict[str, object]] = field(default_factory=list)
     process_action_errors: List[str] = field(default_factory=list)
     resource_profile: str = RESOURCE_PROFILE_DEFAULT
+    auto_resource_profile: bool = True
+    ml_power_mode_active: bool = False
 
 
 class FocusRuntime:
@@ -58,10 +65,12 @@ class FocusRuntime:
         focus_engine: Optional[FocusEngine] = None,
         process_manager: Optional[ProcessManager] = None,
         resource_manager: Optional[ResourceManager] = None,
+        storage_manager: Optional[StorageManager] = None,
     ):
         self.monitor = monitor or SystemMonitor()
         self.focus_engine = focus_engine or FocusEngine()
         self.resource_manager = resource_manager or ResourceManager()
+        self.storage_manager = storage_manager or StorageManager()
         active_pid_provider = getattr(self.monitor, "get_active_window_pid", None)
         if not callable(active_pid_provider):
             active_pid_provider = None
@@ -74,15 +83,69 @@ class FocusRuntime:
             AUTO_OPTIMIZE_USER_PROCESSES and (is_windows() or is_linux())
         )
         self.resource_profile = RESOURCE_PROFILE_DEFAULT
+        self.auto_resource_profile = True
+        self._manual_profile: Optional[str] = None
+        # Tracks whether ML Power Mode was active in the previous refresh cycle
+        # so we know when to restore process priorities on exit.
+        self._ml_power_mode_was_active: bool = False
         self.platform = "Windows" if is_windows() else "Linux" if is_linux() else "Unsupported"
         self.state = FocusOSState()
 
-    def set_resource_profile(self, profile: str) -> Dict[str, object]:
-        """Switch resource policy after restoring settings from the previous profile."""
+    def clean_disk(
+        self,
+        empty_recycle_bin: bool = False,
+        min_age_seconds: Optional[float] = None,
+    ) -> Dict[str, object]:
+        """Safely free disk space by removing eligible aged temp, cache, and prefetch files."""
+        result = self.storage_manager.clean_all_safe_caches(min_age_seconds=min_age_seconds)
+        reclaimed_bytes = int(result.get("reclaimed_bytes", 0))
+        recycle_bytes = 0
+
+        if empty_recycle_bin and is_windows():
+            try:
+                bin_info = StorageManager.recycle_bin_usage()
+                if bin_info.get("items", 0) > 0:
+                    recycle_bytes = int(bin_info.get("bytes", 0))
+                    StorageManager.empty_recycle_bin()
+                    reclaimed_bytes += recycle_bytes
+            except OSError as err:
+                result.setdefault("errors", []).append(f"Recycle Bin cleanup warning: {err}")
+
+        self.state.disk_cleaned_bytes += reclaimed_bytes
+        reclaimed_mb = round(reclaimed_bytes / (1024 * 1024), 2)
+        removed_count = int(result.get("removed_count", 0))
+        summary = (
+            f"Freed {reclaimed_mb:.1f} MB ({removed_count} files cleaned)"
+            if reclaimed_bytes > 0
+            else "No eligible temporary files found to clean."
+        )
+        self.state.last_disk_cleanup_summary = summary
+
+        if self.state.status in {"RUNNING", "PAUSED"}:
+            self.refresh()
+        else:
+            try:
+                metrics = self.monitor.collect()
+                self.state.disk_free_bytes = int(metrics.get("disk_free_bytes", self.state.disk_free_bytes))
+                self.state.disk_usage = float(metrics.get("disk_usage", self.state.disk_usage))
+            except Exception:
+                pass
+
+        return {
+            **result,
+            "reclaimed_bytes": reclaimed_bytes,
+            "reclaimed_mb": reclaimed_mb,
+            "summary": summary,
+        }
+
+    def get_recommended_profile(self, focus_mode: str) -> str:
+        """Map the detected task/tab mode to an optimal resource profile."""
+        return TASK_PROFILE_MAP.get(focus_mode, RESOURCE_PROFILE_DEFAULT)
+
+    def apply_resource_profile(self, profile: str) -> None:
+        """Apply warning thresholds and suspension delay for the given profile."""
         if profile not in RESOURCE_PROFILES:
             raise ValueError(f"Unknown resource profile: {profile}")
-
-        restore_errors = self.process_manager.restore_all()
         settings = RESOURCE_PROFILES[profile]
         self.resource_profile = profile
         self.process_manager.suspend_after_seconds = float(
@@ -94,6 +157,16 @@ class FocusRuntime:
             float(settings["disk_warning"]),
         )
         self.state.resource_profile = profile
+
+    def set_resource_profile(self, profile: str) -> Dict[str, object]:
+        """Manually switch resource policy and lock profile selection."""
+        if profile not in RESOURCE_PROFILES:
+            raise ValueError(f"Unknown resource profile: {profile}")
+
+        self._manual_profile = profile
+        self.state.auto_resource_profile = False
+        restore_errors = self.process_manager.restore_all()
+        self.apply_resource_profile(profile)
         self.state.process_action_errors = restore_errors
 
         if self.state.status in {"RUNNING", "PAUSED"}:
@@ -105,6 +178,15 @@ class FocusRuntime:
         else:
             self.state.suspended_processes = self.process_manager.suspended_count
 
+        return self.snapshot()
+
+    def enable_auto_resource_profile(self) -> Dict[str, object]:
+        """Switch back to automatic profile tuning based on foreground tab/window."""
+        self._manual_profile = None
+        self.auto_resource_profile = True
+        self.state.auto_resource_profile = True
+        if self.state.status in {"RUNNING", "PAUSED"}:
+            return self.refresh()
         return self.snapshot()
 
     def start(self) -> Dict[str, object]:
@@ -155,6 +237,46 @@ class FocusRuntime:
             raise TypeError("Active window title must be a string or None.")
 
         focus = self.focus_engine.update_focus(application, title)
+        focus_mode = str(focus["focus_mode"])
+
+        if self.auto_resource_profile and self._manual_profile is None:
+            recommended = self.get_recommended_profile(focus_mode)
+            if recommended in RESOURCE_PROFILES and recommended != self.resource_profile:
+                self.apply_resource_profile(recommended)
+
+        # ------------------------------------------------------------------
+        # ML Power Mode: when an ML/AI training task is detected, allocate
+        # ALL available resources toward the training process.
+        # - Boost focus process to HIGH_PRIORITY_CLASS (safe, not REALTIME)
+        # - Set an aggressive 10-second suspend delay for background apps
+        # - Immediately flag all currently-idle background PIDs for trimming
+        # When mode exits, restore the original suspend delay automatically.
+        # ------------------------------------------------------------------
+        ml_power_mode_active = (
+            focus_mode == "ml_training" and self.state.status == "RUNNING"
+        )
+
+        if ml_power_mode_active and not self._ml_power_mode_was_active:
+            # Entering ML Power Mode: aggressively cut background slack
+            self.process_manager.suspend_after_seconds = ML_POWER_MODE_SUSPEND_DELAY
+            # Clear delay tracking so background apps are trimmed next cycle
+            self.process_manager._background_since.clear()
+            self.process_manager._trimmed_instances.clear()
+        elif not ml_power_mode_active and self._ml_power_mode_was_active:
+            # Exiting ML Power Mode: restore the current profile delay
+            profile_settings = RESOURCE_PROFILES.get(self.resource_profile, {})
+            self.process_manager.suspend_after_seconds = float(
+                profile_settings.get("suspend_delay_seconds", AUTO_SUSPEND_DELAY_SECONDS)
+            )
+            # Restore all background process priorities to normal
+            self.process_manager.restore_all()
+
+        self._ml_power_mode_was_active = ml_power_mode_active
+        self.state.ml_power_mode_active = ml_power_mode_active
+
+        # Propagate the power mode flag to ProcessManager so boost class is correct.
+        self.process_manager.ml_power_mode = ml_power_mode_active
+
         processes = metrics["processes"]
         if not isinstance(processes, list):
             raise TypeError("System monitor processes must be a list.")

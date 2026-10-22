@@ -49,9 +49,13 @@ class StorageManager:
         return self.safe_cleanup_targets
 
     @staticmethod
-    def _default_roots() -> List[Path]:
+    def get_safe_system_roots() -> List[Path]:
+        """Collect existing safe cleanup target directories on the host."""
         roots = [Path(tempfile.gettempdir())]
         local_app_data = os.environ.get("LOCALAPPDATA")
+        app_data = os.environ.get("APPDATA")
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+
         if local_app_data:
             local = Path(local_app_data)
             roots.extend(
@@ -59,9 +63,58 @@ class StorageManager:
                     local / "Microsoft" / "Windows" / "INetCache",
                     local / "Google" / "Chrome" / "User Data" / "Default" / "Cache",
                     local / "Microsoft" / "Edge" / "User Data" / "Default" / "Cache",
+                    local / "BraveSoftware" / "Brave-Browser" / "User Data" / "Default" / "Cache",
+                    local / "CrashDumps",
                 ]
             )
-        return roots
+        if app_data:
+            roots.append(Path(app_data) / "Microsoft" / "Windows" / "Recent")
+        if system_root and os.name == "nt":
+            sys_path = Path(system_root)
+            roots.extend(
+                [
+                    sys_path / "Temp",
+                    sys_path / "Prefetch",
+                ]
+            )
+        return [r for r in roots if r.is_dir()]
+
+    @staticmethod
+    def _default_roots() -> List[Path]:
+        return StorageManager.get_safe_system_roots()
+
+    def clean_all_safe_caches(
+        self,
+        min_age_seconds: Optional[float] = None,
+    ) -> Dict[str, object]:
+        """Scan and automatically delete eligible aged temporary and cache files."""
+        original_min_age = self.min_age_seconds
+        if min_age_seconds is not None:
+            self.min_age_seconds = min_age_seconds
+        try:
+            scan = self.scan_candidates()
+            candidates = scan.get("candidates") or []
+            if not candidates:
+                return {
+                    "candidate_count": 0,
+                    "removed_count": 0,
+                    "reclaimed_bytes": 0,
+                    "reclaimed_mb": 0.0,
+                    "removed": [],
+                    "errors": scan.get("errors") or [],
+                }
+            cleanup = self.delete_approved_candidates(candidates)
+            reclaimed_bytes = int(cleanup.get("reclaimed_bytes", 0))
+            return {
+                "candidate_count": len(candidates),
+                "removed_count": int(cleanup.get("removed_count", 0)),
+                "reclaimed_bytes": reclaimed_bytes,
+                "reclaimed_mb": round(reclaimed_bytes / (1024 * 1024), 2),
+                "removed": cleanup.get("removed") or [],
+                "errors": [*(scan.get("errors") or []), *(cleanup.get("errors") or [])],
+            }
+        finally:
+            self.min_age_seconds = original_min_age
 
     def scan_candidates(self) -> Dict[str, object]:
         """List old temporary/cache files as recommendations; never remove them."""
