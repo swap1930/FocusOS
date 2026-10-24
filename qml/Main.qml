@@ -143,15 +143,6 @@ ApplicationWindow {
                 AppButton { text: "Stop"; kind: "danger"; enabled: backend.canStop; onClicked: backend.stopRuntime() }
                 AppButton { text: "Emergency disable"; kind: "danger"; enabled: backend.canStop; onClicked: backend.emergencyDisable() }
                 AppButton { text: "Clean disk"; enabled: backend.canCleanDisk; onClicked: backend.cleanDisk() }
-                AppButton {
-                    text: "Restart as administrator"
-                    visible: backend.supportsAdminRestart && !backend.isElevated
-                    enabled: backend.canStart || backend.canPause || backend.canResume || backend.canStop
-                    onClicked: {
-                        if (backend.restartAsAdmin())
-                            win.close()
-                    }
-                }
                 Item { Layout.fillWidth: true }
             }
 
@@ -186,44 +177,107 @@ ApplicationWindow {
                              : Theme.text
                     }
                 }
-                // ML Power Mode badge � shown only when ML/AI training is detected
+                ComboBox {
+                    id: trainingTarget
+                    readonly property var candidates: backend.state.trainingCandidates || []
+                    Layout.preferredWidth: 250
+                    enabled: backend.canChangeResourceProfile && !backend.state.mlPowerModeEnabled
+                    textRole: "label"
+                    model: candidates
+                    displayText: candidates.length === 0
+                        ? "No process available"
+                        : currentIndex >= 0 ? currentText : "Select training process"
+                    property int selectedPid: currentIndex >= 0 && currentIndex < candidates.length
+                        ? candidates[currentIndex].pid : 0
+                    implicitHeight: 38
+                    font.pixelSize: 12
+                    palette.text: Theme.text
+                    palette.buttonText: Theme.text
+                    background: Rectangle {
+                        radius: 8
+                        color: trainingTarget.enabled ? Theme.surface : Theme.buttonOffBg
+                        border.color: trainingTarget.activeFocus ? Theme.accent : Theme.borderStrong
+                        border.width: trainingTarget.activeFocus ? 2 : 1
+                    }
+                    contentItem: Text {
+                        leftPadding: 12
+                        rightPadding: 32
+                        text: trainingTarget.displayText
+                        font: trainingTarget.font
+                        color: trainingTarget.enabled ? Theme.text : Theme.muted
+                        verticalAlignment: Text.AlignVCenter
+                        elide: Text.ElideRight
+                    }
+                    indicator: Text {
+                        x: trainingTarget.width - width - 12
+                        y: (trainingTarget.height - height) / 2
+                        text: trainingTarget.popup.visible ? "▴" : "▾"
+                        color: Theme.muted
+                        font.pixelSize: 13
+                    }
+                    delegate: ItemDelegate {
+                        width: trainingTarget.width
+                        highlighted: trainingTarget.highlightedIndex === index
+                        contentItem: Text {
+                            text: modelData.label
+                            color: Theme.text
+                            font: trainingTarget.font
+                            verticalAlignment: Text.AlignVCenter
+                            elide: Text.ElideRight
+                        }
+                        background: Rectangle {
+                            color: parent.highlighted ? Theme.select : Theme.surface
+                        }
+                    }
+                    popup: Popup {
+                        y: trainingTarget.height + 4
+                        width: trainingTarget.width
+                        implicitHeight: Math.min(contentItem.implicitHeight, 280)
+                        padding: 4
+                        contentItem: ListView {
+                            clip: true
+                            implicitHeight: contentHeight
+                            model: trainingTarget.popup.visible ? trainingTarget.delegateModel : null
+                            currentIndex: trainingTarget.highlightedIndex
+                            ScrollIndicator.vertical: ScrollIndicator {}
+                        }
+                        background: Rectangle {
+                            color: Theme.surface
+                            border.color: Theme.borderStrong
+                            radius: 8
+                        }
+                    }
+                }
+                AppButton {
+                    text: backend.state.mlPowerModeEnabled ? "Stop ML focus" : "Focus selected ML process"
+                    enabled: backend.canChangeResourceProfile && (
+                        backend.state.mlPowerModeEnabled || trainingTarget.selectedPid > 0
+                    )
+                    onClicked: backend.setMLPowerMode(
+                        !backend.state.mlPowerModeEnabled,
+                        trainingTarget.selectedPid
+                    )
+                }
                 Rectangle {
                     implicitWidth: mlPowerLabel.implicitWidth + 24
                     implicitHeight: 26
                     radius: height / 2
                     visible: backend.state.mlPowerModeActive === true
-                    color: "#3d1a6e"
+                    color: Theme.dark ? "#3d1a6e" : "#f2e8ff"
                     border.width: 1
-                    border.color: "#9b59b6"
+                    border.color: Theme.dark ? "#9b59b6" : "#c9a7ee"
                     Text {
                         id: mlPowerLabel
                         anchors.centerIn: parent
-                        text: "\u26a1 ML Power Mode"
+                        text: "Focused: " + backend.state.mlTrainingTargetName
                         font.pixelSize: 12
                         font.weight: Font.Bold
-                        color: "#d7a8ff"
+                        color: Theme.dark ? "#d7a8ff" : "#63349b"
                     }
                 }
-                Text {
-                    text: backend.resourceProfileDescription
-                    color: Theme.muted
-                    Layout.fillWidth: true
-                    wrapMode: Text.Wrap
-                    font.pixelSize: 11
-                }
+
             }
 
-            Text {
-                Layout.fillWidth: true
-                text: backend.supportsAdminRestart
-                    ? "Automatic optimization is active while running: FocusOS detects your active tab and application to automatically adjust background memory cleanup and process priority. The active app gets higher priority while unused background apps are trimmed automatically; RAM is not transferred and apps may reload pages."
-                    : backend.platformName === "Linux"
-                        ? "Linux applies reversible SCHED_BATCH scheduling to eligible background apps and requests kernel page-out based on the active tab and task; the kernel may deny page-out, and RAM is not transferred. X11 needs xdotool; GNOME Wayland installs a user-level focus extension automatically."
-                        : "This operating system is not supported for process controls; monitoring may be limited."
-                color: Theme.muted
-                wrapMode: Text.Wrap
-                font.pixelSize: 11
-            }
 
             // Metric cards
             RowLayout {
@@ -263,7 +317,9 @@ ApplicationWindow {
                         Chip { text: backend.state.focusScore }
                     }
                     Text {
-                        text: backend.state.focusApp
+                        text: backend.state.mlPowerModeActive
+                            ? "ML Training Focus: " + backend.state.mlTrainingTargetName
+                            : backend.state.focusApp
                         color: Theme.text
                         font.pixelSize: 18
                         font.weight: Font.Bold
@@ -271,7 +327,9 @@ ApplicationWindow {
                         elide: Text.ElideRight
                     }
                     Text {
-                        text: backend.state.focusWindow
+                        text: backend.state.mlPowerModeActive
+                            ? "Selected training process (PID " + backend.state.mlTrainingTargetPid + ")"
+                            : backend.state.focusWindow
                         color: Theme.muted
                         Layout.fillWidth: true
                         wrapMode: Text.Wrap

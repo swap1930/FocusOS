@@ -13,7 +13,7 @@ from config.settings import CLEANUP_MAX_CANDIDATES, CLEANUP_MIN_AGE_DAYS
 
 
 class StorageManager:
-    """Find old files and delete only explicitly reviewed candidates."""
+    """Find old cache/temp files and safely delete eligible candidates."""
 
     def __init__(
         self,
@@ -56,6 +56,17 @@ class StorageManager:
         app_data = os.environ.get("APPDATA")
         system_root = os.environ.get("SystemRoot", r"C:\Windows")
 
+        if os.name != "nt":
+            cache_home = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+            roots.extend(
+                [
+                    cache_home / "thumbnails",
+                    cache_home / "mozilla" / "firefox" / "Profiles",
+                    cache_home / "google-chrome" / "Default" / "Cache",
+                    cache_home / "chromium" / "Default" / "Cache",
+                ]
+            )
+
         if local_app_data:
             local = Path(local_app_data)
             roots.extend(
@@ -64,7 +75,7 @@ class StorageManager:
                     local / "Google" / "Chrome" / "User Data" / "Default" / "Cache",
                     local / "Microsoft" / "Edge" / "User Data" / "Default" / "Cache",
                     local / "BraveSoftware" / "Brave-Browser" / "User Data" / "Default" / "Cache",
-                    local / "CrashDumps",
+                    local / "Packages",
                 ]
             )
         if app_data:
@@ -87,7 +98,7 @@ class StorageManager:
         self,
         min_age_seconds: Optional[float] = None,
     ) -> Dict[str, object]:
-        """Scan and automatically delete eligible aged temporary and cache files."""
+        """Automatically remove old eligible files from configured cache/temp roots."""
         original_min_age = self.min_age_seconds
         if min_age_seconds is not None:
             self.min_age_seconds = min_age_seconds
@@ -206,7 +217,7 @@ class StorageManager:
         self,
         candidates: List[Dict[str, object]],
     ) -> Dict[str, object]:
-        """Delete approved old regular files directly inside configured roots."""
+        """Delete old regular files directly inside configured safe roots."""
         reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
         safe_roots = []
         for configured_root in self.roots:
@@ -266,9 +277,10 @@ class StorageManager:
 
     @staticmethod
     def _delete_unlocked_file(path: Path) -> None:
-        """Delete a file only after Windows grants an exclusive handle to it."""
+        """Delete a validated regular file using the host platform's file API."""
         if os.name != "nt":
-            raise OSError("Safe unlocked-file deletion is supported on Windows only.")
+            path.unlink()
+            return
 
         import ctypes
         from ctypes import wintypes

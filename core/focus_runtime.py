@@ -54,6 +54,9 @@ class FocusOSState:
     resource_profile: str = RESOURCE_PROFILE_DEFAULT
     auto_resource_profile: bool = True
     ml_power_mode_active: bool = False
+    ml_power_mode_enabled: bool = False
+    ml_training_target_pid: Optional[int] = None
+    ml_training_target_name: Optional[str] = None
 
 
 class FocusRuntime:
@@ -85,8 +88,11 @@ class FocusRuntime:
         self.resource_profile = RESOURCE_PROFILE_DEFAULT
         self.auto_resource_profile = True
         self._manual_profile: Optional[str] = None
-        # Tracks whether ML Power Mode was active in the previous refresh cycle
-        # so we know when to restore process priorities on exit.
+        # ML focus boosting is opt-in, while the displayed toggle may still
+        # reflect automatic detection until the user explicitly changes it.
+        self._ml_power_mode_enabled = False
+        self._ml_target_pid: Optional[int] = None
+        self._ml_target_name: Optional[str] = None
         self._ml_power_mode_was_active: bool = False
         self.platform = "Windows" if is_windows() else "Linux" if is_linux() else "Unsupported"
         self.state = FocusOSState()
@@ -137,6 +143,33 @@ class FocusRuntime:
             "reclaimed_mb": reclaimed_mb,
             "summary": summary,
         }
+
+    def set_ml_power_mode(
+        self,
+        enabled: bool,
+        target_pid: Optional[int] = None,
+    ) -> Dict[str, object]:
+        """Enable ML focus for a selected process and restore policy when disabled."""
+        self._ml_power_mode_enabled = bool(enabled)
+        self._ml_target_pid = target_pid if enabled else None
+        self._ml_target_name = None
+        self.state.ml_power_mode_enabled = self._ml_power_mode_enabled
+        self.state.ml_training_target_pid = self._ml_target_pid
+        if self.state.status in {"RUNNING", "PAUSED"}:
+            return self.refresh()
+        if not self._ml_power_mode_enabled:
+            self.state.ml_training_target_pid = None
+            self.state.ml_training_target_name = None
+            self.process_manager.ml_power_mode = False
+            if self._ml_power_mode_was_active:
+                self.process_manager.restore_all()
+                settings = RESOURCE_PROFILES.get(self.resource_profile, {})
+                self.process_manager.suspend_after_seconds = float(
+                    settings.get("suspend_delay_seconds", AUTO_SUSPEND_DELAY_SECONDS)
+                )
+                self._ml_power_mode_was_active = False
+            self.state.ml_power_mode_active = False
+        return self.snapshot()
 
     def get_recommended_profile(self, focus_mode: str) -> str:
         """Map the detected task/tab mode to an optimal resource profile."""
@@ -245,16 +278,30 @@ class FocusRuntime:
                 self.apply_resource_profile(recommended)
 
         # ------------------------------------------------------------------
-        # ML Power Mode: when an ML/AI training task is detected, allocate
-        # ALL available resources toward the training process.
-        # - Boost focus process to HIGH_PRIORITY_CLASS (safe, not REALTIME)
-        # - Set an aggressive 10-second suspend delay for background apps
-        # - Immediately flag all currently-idle background PIDs for trimming
-        # When mode exits, restore the original suspend delay automatically.
-        # ------------------------------------------------------------------
+        # ML mode is explicitly user-selected and targets one process. Normal
+        # focus mode continues to follow the current foreground application.
+        foreground_pid = window.get("pid")
+        process_by_pid = {
+            item.get("pid"): item
+            for item in metrics.get("processes", [])
+            if isinstance(item, dict)
+        }
+        target_process = process_by_pid.get(self._ml_target_pid)
+        if target_process is not None:
+            self._ml_target_name = str(target_process.get("name", "Unknown process"))
+        elif self._ml_target_pid is not None:
+            self._ml_target_pid = None
+            self._ml_target_name = None
+            self.state.ml_training_target_pid = None
+            self.state.ml_training_target_name = None
         ml_power_mode_active = (
-            focus_mode == "ml_training" and self.state.status == "RUNNING"
+            self._ml_power_mode_enabled
+            and self.state.status == "RUNNING"
+            and self._ml_target_pid is not None
         )
+        self.state.ml_power_mode_enabled = self._ml_power_mode_enabled
+        self.state.ml_training_target_pid = self._ml_target_pid
+        self.state.ml_training_target_name = self._ml_target_name
 
         if ml_power_mode_active and not self._ml_power_mode_was_active:
             # Entering ML Power Mode: aggressively cut background slack
@@ -280,9 +327,12 @@ class FocusRuntime:
         processes = metrics["processes"]
         if not isinstance(processes, list):
             raise TypeError("System monitor processes must be a list.")
+        priority_focus_pid = (
+            self._ml_target_pid if ml_power_mode_active else foreground_pid
+        )
         priority_plan = self.process_manager.build_priority_plan(
             processes,
-            window.get("pid"),
+            priority_focus_pid,
             apply_controls=self.state.status == "RUNNING",
         )
 

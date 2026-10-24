@@ -29,13 +29,33 @@ from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuickControls2 import QQuickStyle
 
 from config.settings import RESOURCE_PROFILES
-from core.elevation import is_user_admin, request_elevated_restart
 from core.focus_runtime import FocusRuntime
-from core.platform_support import supports_admin_restart
 
 
 QML_DIR = Path(__file__).resolve().parent / "qml"
 HISTORY_LIMIT = 120
+TRAINING_PROCESS_KEYWORDS = (
+    "code.exe",
+    "devenv.exe",
+    "pycharm",
+    "idea64",
+    "idea.exe",
+    "studio64",
+    "jupyter",
+    "python.exe",
+    "python3",
+    "ollama",
+    "lmstudio",
+    "llama-server",
+    "chrome.exe",
+    "msedge.exe",
+    "firefox.exe",
+    "brave.exe",
+    "chromium",
+    "google chrome",
+    "microsoft edge",
+    "colab",
+)
 
 
 class MetricHistory:
@@ -157,6 +177,18 @@ class DashboardWorker(QObject):
             return
         self.operation_completed.emit(f"profile:{profile}", state, "")
 
+    @Slot(bool, int)
+    def set_ml_power_mode(self, enabled: bool, target_pid: int) -> None:
+        try:
+            state = self.runtime.set_ml_power_mode(
+                enabled,
+                target_pid if enabled and target_pid > 0 else None,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            self.operation_completed.emit("ml_power_mode", None, str(error))
+            return
+        self.operation_completed.emit("ml_power_mode", state, "")
+
     @Slot()
     def clean_disk(self) -> None:
         try:
@@ -192,6 +224,11 @@ def _default_state() -> Dict[str, Any]:
         "warningActive": False,
         "summary": "",
         "resourceProfile": RESOURCE_PROFILES["balanced"]["label"],
+        "mlPowerModeEnabled": False,
+        "mlPowerModeActive": False,
+        "mlTrainingTargetPid": 0,
+        "mlTrainingTargetName": "",
+        "trainingCandidates": [],
         "diskCleaned": "0.0 B",
         "diskCleanedSummary": "",
     }
@@ -212,6 +249,7 @@ class DashboardBackend(QObject):
     request_control = Signal(str)
     request_resource_profile = Signal(str)
     request_clean_disk = Signal()
+    request_ml_power_mode = Signal(bool, int)
 
     def __init__(self, runtime: Optional[FocusRuntime] = None):
         super().__init__()
@@ -225,11 +263,10 @@ class DashboardBackend(QObject):
         self._control_pending = False
         self._profile_pending = False
         self._disk_cleaning = False
+        self._startup_cleanup_pending = False
         self._resource_profile = self.runtime.resource_profile
         self._closing = False
         self._shutdown_complete = False
-        self._is_elevated = is_user_admin()
-
         self._dark = False
 
         self._plan_model = RowsModel(self)
@@ -242,6 +279,7 @@ class DashboardBackend(QObject):
         self.request_control.connect(self.worker.run_control)
         self.request_resource_profile.connect(self.worker.set_resource_profile)
         self.request_clean_disk.connect(self.worker.clean_disk)
+        self.request_ml_power_mode.connect(self.worker.set_ml_power_mode)
         self.worker.operation_completed.connect(self._handle_operation_completed)
         self.worker_thread.finished.connect(self.worker.deleteLater)
         self.worker_thread.start()
@@ -279,13 +317,6 @@ class DashboardBackend(QObject):
     def darkMode(self) -> bool:
         return self._dark
 
-    @Property(bool, constant=True)
-    def isElevated(self) -> bool:
-        return self._is_elevated
-
-    @Property(bool, constant=True)
-    def supportsAdminRestart(self) -> bool:
-        return supports_admin_restart()
 
     @Property(str, constant=True)
     def platformName(self) -> str:
@@ -347,6 +378,11 @@ class DashboardBackend(QObject):
     def begin(self) -> None:
         self._timer.start()
         self.startRuntime()
+        self._startup_cleanup_pending = True
+        self._disk_cleaning = True
+        self.controlsChanged.emit()
+        self._set_message("Automatically cleaning eligible old cache/temp files...", "info")
+        self.request_clean_disk.emit()
 
     @Slot(result=bool)
     def tryClose(self) -> bool:
@@ -357,7 +393,7 @@ class DashboardBackend(QObject):
             self._closing = True
             self._timer.stop()
             self.controlsChanged.emit()
-            if not self._control_pending:
+            if not self._control_pending and not self._startup_cleanup_pending:
                 self._run_control("stop")
         return False
 
@@ -408,6 +444,18 @@ class DashboardBackend(QObject):
         self._set_message("Applying resource profile...", "info")
         self.request_resource_profile.emit(profile)
 
+    @Slot(bool, int)
+    def setMLPowerMode(self, enabled: bool, target_pid: int) -> None:
+        if self._control_pending or self._profile_pending or self._closing:
+            return
+        if enabled and target_pid <= 0:
+            self._set_message("Select a training process before enabling ML mode.", "warn")
+            return
+        self._control_pending = True
+        self.controlsChanged.emit()
+        self._set_message("Updating ML training focus...", "info")
+        self.request_ml_power_mode.emit(enabled, target_pid)
+
     @Slot()
     def cleanDisk(self) -> None:
         if self._disk_cleaning or self._closing:
@@ -417,29 +465,11 @@ class DashboardBackend(QObject):
         self._set_message("Scanning and cleaning temporary files...", "info")
         self.request_clean_disk.emit()
 
-    @Slot(result=bool)
-    def restartAsAdmin(self) -> bool:
-        if self._is_elevated:
-            self._set_message("FocusOS is already running as administrator.", "info")
-            return False
-        script_path = str(Path(sys.argv[0]).resolve())
-        error = request_elevated_restart(
-            [script_path, *sys.argv[1:]],
-            os.getpid(),
-        )
-        if error:
-            self._set_message(error, "error" if "cancelled" not in error else "warn")
-            return False
-        self._set_message(
-            "Administrator restart requested. FocusOS will restore managed settings and close first.",
-            "info",
-        )
-        return True
-
     def _run_control(self, action: str) -> None:
         if (
             self._control_pending
             or self._profile_pending
+            or self._startup_cleanup_pending
             or (self._closing and action != "stop")
         ):
             return
@@ -479,6 +509,9 @@ class DashboardBackend(QObject):
                 summary = str(state.get("last_disk_cleanup_summary") or "Disk cleanup complete.")
                 self._set_message(summary, "info")
                 self.update_dashboard(state)
+            self._startup_cleanup_pending = False
+            if self._closing and not self._control_pending:
+                self._run_control("stop")
             return
 
         if action == "refresh":
@@ -550,8 +583,16 @@ class DashboardBackend(QObject):
             "diskCleaned": _format_bytes(state.get("disk_cleaned_bytes", 0)),
             "diskCleanedSummary": str(state.get("last_disk_cleanup_summary") or ""),
             "gpu": -1.0 if gpu is None else float(gpu),
-            "focusApp": str(state.get("focus_application") or "Unknown application"),
-            "focusWindow": f"Window: {state.get('focus_window') or 'Unknown'}",
+            "focusApp": str(
+                (state.get("ml_training_target_name") or "Selected training process")
+                if state.get("ml_power_mode_active")
+                else state.get("focus_application") or "Unknown application"
+            ),
+            "focusWindow": (
+                f"Selected ML process (PID {state.get('ml_training_target_pid')})"
+                if state.get("ml_power_mode_active")
+                else f"Window: {state.get('focus_window') or 'Unknown'}"
+            ),
             "focusMode": f"Mode: {state.get('focus_mode', 'idle')}",
             "focusScore": f"Focus score {int(state.get('focus_score', 0))}/100",
             "warningText": (
@@ -563,6 +604,24 @@ class DashboardBackend(QObject):
             ),
             "warningActive": bool(warnings or focus_warning),
             "mlPowerModeActive": bool(state.get("ml_power_mode_active", False)),
+            "mlPowerModeEnabled": bool(state.get("ml_power_mode_enabled", False)),
+            "mlTrainingTargetPid": int(state.get("ml_training_target_pid") or 0),
+            "mlTrainingTargetName": str(state.get("ml_training_target_name") or ""),
+            "trainingCandidates": [
+                {
+                    "pid": int(item.get("pid", 0)),
+                    "name": str(item.get("name", "Unknown process")),
+                    "label": f"{item.get('name', 'Unknown process')} (PID {item.get('pid', 0)})",
+                }
+                for item in (state.get("priority_plan") or [])
+                if int(item.get("pid", 0)) > 0
+                and str(item.get("name", "")).casefold()
+                not in self.runtime.process_manager._PROTECTED_NAMES
+                and any(
+                    keyword in str(item.get("name", "")).casefold()
+                    for keyword in TRAINING_PROCESS_KEYWORDS
+                )
+            ],
             "summary": (
                 f"Processes: {int(state.get('active_processes', 0))} active  |  "
                 f"{int(state.get('background_processes', 0))} background  |  "
