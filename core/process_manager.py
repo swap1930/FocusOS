@@ -76,6 +76,7 @@ class ProcessManager:
         # When True the focused process is boosted to HIGH_PRIORITY_CLASS instead
         # of the default ABOVE_NORMAL_PRIORITY_CLASS – activated by ML Power Mode.
         self.ml_power_mode = False
+        self._ml_memory_trim_after_seconds: Optional[float] = None
         self._clock = clock
         self._process_factory = process_factory
         self._active_pid_provider = active_pid_provider
@@ -131,6 +132,12 @@ class ProcessManager:
             else ""
         )
         focused_allowlisted_name = focused_name if focused_name in self.allowlist else ""
+        ml_target_pids = (
+            self._get_process_family_pids(focus_pid, processes)
+            if self.ml_power_mode
+            else set()
+        )
+
         seen: set[ProcessIdentity] = set()
         plan = []
 
@@ -143,14 +150,21 @@ class ProcessManager:
             identity = (pid, create_time) if isinstance(pid, int) else (-1, None)
             seen.add(identity)
             is_focused = pid == focus_pid
+            is_related = pid in ml_target_pids
             is_allowlisted_app = normalized_name in self.allowlist
             is_selected_instance = identity in self.selected_instances
             is_focused_app = (
-                bool(focused_allowlisted_name and normalized_name == focused_allowlisted_name)
+                bool(focused_allowlisted_name and normalized_name == focused_name)
                 or (is_selected_instance and is_focused)
             )
+            is_priority_target = is_focused or is_related
+            was_ml_target = (
+                self.ml_power_mode
+                and identity in self._original_priorities
+                and not is_priority_target
+            )
 
-            if is_focused:
+            if is_priority_target:
                 classification = "active"
                 priority = "high"
             else:
@@ -194,13 +208,16 @@ class ProcessManager:
                     if background_seconds >= self.suspend_after_seconds and not suspended:
                         action_error = self._suspend(identity, pid, normalized_name)
                         suspended = identity in self._suspended
+            elif apply_controls and was_ml_target:
+                action_error = self._restore_priority(identity) or action_error
+                action_error = self._restore_linux_scheduler(identity) or action_error
             elif (
                 apply_controls
                 and self.auto_optimize_user_processes
                 and global_focus_verified
                 and not is_protected_name
             ):
-                if is_windows() and is_focused:
+                if is_windows() and is_priority_target:
                     self._background_since.pop(identity, None)
                     self._trimmed_instances.discard(identity)
                     action_error = self._resume(identity) or action_error
@@ -218,8 +235,13 @@ class ProcessManager:
                     action_error = self._lower_priority(identity, pid) or action_error
                     started = self._background_since.setdefault(identity, now)
                     background_seconds = max(0.0, now - started)
+                    trim_delay = (
+                        min(self.suspend_after_seconds, self._ml_memory_trim_after_seconds)
+                        if self.ml_power_mode and self._ml_memory_trim_after_seconds is not None
+                        else self.suspend_after_seconds
+                    )
                     if (
-                        background_seconds >= self.suspend_after_seconds
+                        background_seconds >= trim_delay
                         and identity not in self._trimmed_instances
                     ):
                         try:
@@ -250,18 +272,26 @@ class ProcessManager:
                             if warning:
                                 action_error = warning
                                 self.action_errors.append(warning)
-                elif is_linux() and is_focused:
+                elif is_linux() and is_priority_target:
                     self._background_since.pop(identity, None)
                     self._trimmed_instances.discard(identity)
                     self._linux_scheduler_attempted.discard(identity)
                     action_error = self._resume(identity) or action_error
+                    action_error = self._restore_priority(identity) or action_error
                     action_error = self._restore_linux_scheduler(identity) or action_error
+                    if self.ml_power_mode:
+                        action_error = self._boost_linux_priority(identity, pid) or action_error
                 elif is_linux():
                     started = self._background_since.setdefault(identity, now)
                     background_seconds = max(0.0, now - started)
                     action_error = self._lower_linux_scheduler(identity, pid) or action_error
+                    trim_delay = (
+                        min(self.suspend_after_seconds, self._ml_memory_trim_after_seconds)
+                        if self.ml_power_mode and self._ml_memory_trim_after_seconds is not None
+                        else self.suspend_after_seconds
+                    )
                     if (
-                        background_seconds >= self.suspend_after_seconds
+                        background_seconds >= trim_delay
                         and identity not in self._trimmed_instances
                     ):
                         try:
@@ -337,6 +367,27 @@ class ProcessManager:
 
         return plan
 
+    @staticmethod
+    def _get_process_family_pids(
+        focus_pid: Optional[int],
+        processes: List[Dict[str, object]],
+    ) -> set[int]:
+        """Return a selected process and its descendants from the current snapshot."""
+        if not isinstance(focus_pid, int):
+            return set()
+        family = {focus_pid}
+        changed = True
+        while changed:
+            changed = False
+            for item in processes:
+                pid = item.get("pid")
+                parent_pid = item.get("ppid")
+                if isinstance(pid, int) and isinstance(parent_pid, int):
+                    if parent_pid in family and pid not in family:
+                        family.add(pid)
+                        changed = True
+        return family
+
     def restore_all(self) -> List[str]:
         """Resume processes and restore priorities changed by this manager."""
         self.action_errors = []
@@ -349,6 +400,7 @@ class ProcessManager:
         self._background_since.clear()
         self._trimmed_instances.clear()
         self._linux_scheduler_attempted.clear()
+        self._ml_memory_trim_after_seconds = None
         return list(self.action_errors)
 
     def list_suspend_candidates(
@@ -677,6 +729,28 @@ class ProcessManager:
             self._record_error(identity[0], error)
             return str(error)
         self._suspended.pop(identity, None)
+        return None
+
+    def _boost_linux_priority(
+        self,
+        identity: ProcessIdentity,
+        pid: object,
+    ) -> Optional[str]:
+        """Apply a reversible nice adjustment without using privileged realtime priority."""
+        if not is_linux() or identity in self._original_priorities:
+            return None
+        process = self._get_safe_process(identity)
+        if process is None:
+            return None
+        try:
+            original_nice = process.nice()
+            process.nice(min(19, int(original_nice) + 5))
+        except (psutil.NoSuchProcess, ProcessLookupError):
+            return None
+        except (psutil.Error, OSError) as error:
+            self._record_error(pid, error)
+            return str(error)
+        self._original_priorities[identity] = (process, original_nice)
         return None
 
     def _boost_priority(

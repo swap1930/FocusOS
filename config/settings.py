@@ -58,9 +58,11 @@ RESOURCE_PROFILES = {
 }
 
 # ---------------------------------------------------------------------------
-# ML Power Mode – activated automatically when focus_mode == "ml_training"
+# ML Power Mode – explicitly activated for a selected training process.
 # ---------------------------------------------------------------------------
-# Suspend background apps after only 10 s instead of the profile default.
+# Delay before safely trimming eligible background working sets in ML mode.
+ML_POWER_MODE_MEMORY_TRIM_DELAY = 10.0
+# Suspension remains restricted to explicitly allowlisted/selected applications.
 ML_POWER_MODE_SUSPEND_DELAY = 10.0
 # Priority class used to boost the ML/AI training process on Windows.
 # HIGH_PRIORITY_CLASS gives maximum CPU scheduling without risking a system

@@ -2,7 +2,7 @@
 
 import pytest
 
-from config.settings import AUTO_SUSPEND_DELAY_SECONDS, ML_POWER_MODE_SUSPEND_DELAY
+from config.settings import AUTO_SUSPEND_DELAY_SECONDS, ML_POWER_MODE_MEMORY_TRIM_DELAY
 from core.focus_runtime import FocusRuntime
 
 
@@ -73,7 +73,8 @@ def test_ml_mode_does_not_auto_enable_from_ml_window_title():
     assert state["focus_mode"] == "ml_training", "focus_mode should be ml_training"
     assert state["ml_power_mode_active"] is False
     assert pm.ml_power_mode is False
-    assert pm.suspend_after_seconds != ML_POWER_MODE_SUSPEND_DELAY
+    assert pm.suspend_after_seconds == 60
+    assert getattr(pm, "_ml_memory_trim_after_seconds", None) is None
 
 
 def test_ml_power_mode_not_active_for_normal_task():
@@ -86,8 +87,9 @@ def test_ml_power_mode_not_active_for_normal_task():
 
     assert state["ml_power_mode_active"] is False
     assert pm.ml_power_mode is False
-    # Suspend delay should NOT be the aggressive ML value
-    assert pm.suspend_after_seconds != ML_POWER_MODE_SUSPEND_DELAY
+    # Normal mode keeps the standard suspension delay and has no ML trim timer.
+    assert pm.suspend_after_seconds == 60
+    assert getattr(pm, "_ml_memory_trim_after_seconds", None) is None
 
 
 def test_ml_power_mode_restores_delay_when_selected_target_loses_focus():
@@ -98,7 +100,8 @@ def test_ml_power_mode_restores_delay_when_selected_target_loses_focus():
 
     runtime.set_ml_power_mode(True, target_pid=30)
     runtime.start()
-    assert pm.suspend_after_seconds == ML_POWER_MODE_SUSPEND_DELAY
+    assert pm.suspend_after_seconds == 60
+    assert pm._ml_memory_trim_after_seconds == ML_POWER_MODE_MEMORY_TRIM_DELAY
 
     # Switch focus away from the selected training process.
     monitor.active_window = {"application": "Code.exe", "title": "app.py - VS Code", "pid": 31}
@@ -107,7 +110,8 @@ def test_ml_power_mode_restores_delay_when_selected_target_loses_focus():
     assert state["ml_power_mode_active"] is False
     assert pm.ml_power_mode is False
     # Delay must be restored to the profile's configured value (not the aggressive ML value)
-    assert pm.suspend_after_seconds != ML_POWER_MODE_SUSPEND_DELAY
+    assert pm.suspend_after_seconds == 60
+    assert pm._ml_memory_trim_after_seconds is None
     # restore_all() must have been called to reset process priorities
     assert pm._restore_all_called >= 1
 
@@ -171,7 +175,8 @@ def test_ml_power_mode_can_be_manually_disabled_and_restores_policy():
     assert state["ml_power_mode_enabled"] is False
     assert state["ml_power_mode_active"] is False
     assert pm.ml_power_mode is False
-    assert pm.suspend_after_seconds != ML_POWER_MODE_SUSPEND_DELAY
+    assert pm.suspend_after_seconds == 60
+    assert pm._ml_memory_trim_after_seconds is None
     assert pm._restore_all_called >= 1
 
 

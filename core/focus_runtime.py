@@ -9,7 +9,7 @@ from config.settings import (
     AUTO_OPTIMIZE_USER_PROCESSES,
     AUTO_SUSPEND_ALLOWLIST,
     AUTO_SUSPEND_DELAY_SECONDS,
-    ML_POWER_MODE_SUSPEND_DELAY,
+    ML_POWER_MODE_MEMORY_TRIM_DELAY,
     RESOURCE_PROFILE_DEFAULT,
     RESOURCE_PROFILES,
     TASK_PROFILE_MAP,
@@ -304,8 +304,9 @@ class FocusRuntime:
         self.state.ml_training_target_name = self._ml_target_name
 
         if ml_power_mode_active and not self._ml_power_mode_was_active:
-            # Entering ML Power Mode: aggressively cut background slack
-            self.process_manager.suspend_after_seconds = ML_POWER_MODE_SUSPEND_DELAY
+            # ML mode rapidly trims eligible background working sets without
+            # suspending arbitrary applications or changing their lifecycle.
+            self.process_manager._ml_memory_trim_after_seconds = ML_POWER_MODE_MEMORY_TRIM_DELAY
             # Clear delay tracking so background apps are trimmed next cycle
             self.process_manager._background_since.clear()
             self.process_manager._trimmed_instances.clear()
@@ -315,6 +316,7 @@ class FocusRuntime:
             self.process_manager.suspend_after_seconds = float(
                 profile_settings.get("suspend_delay_seconds", AUTO_SUSPEND_DELAY_SECONDS)
             )
+            self.process_manager._ml_memory_trim_after_seconds = None
             # Restore all background process priorities to normal
             self.process_manager.restore_all()
 

@@ -15,6 +15,7 @@ from api.focus_api import FocusAPI
 from config.settings import (
     AUTO_OPTIMIZE_USER_PROCESSES,
     AUTO_SUSPEND_DELAY_SECONDS,
+    ML_POWER_MODE_MEMORY_TRIM_DELAY,
     CLEANUP_AUTO_MIN_AGE_SECONDS,
     RESOURCE_PROFILES,
 )
@@ -678,23 +679,29 @@ def test_linux_auto_optimization_batches_background_and_restores_foreground(monk
             trim_calls.append(pid) or (4 * 1024 * 1024, None)
         ),
     )
+    manager.ml_power_mode = True
+    manager._ml_memory_trim_after_seconds = ML_POWER_MODE_MEMORY_TRIM_DELAY
     manager.auto_optimize_user_processes = True
     process_info = [
-        {"pid": 50020, "name": "editor", "create_time": 123.0},
-        {"pid": 50021, "name": "browser", "create_time": 123.0},
+        {"pid": 50020, "name": "editor", "create_time": 123.0, "ppid": 1},
+        {"pid": 50021, "name": "browser", "create_time": 123.0, "ppid": 1},
     ]
 
     manager.build_priority_plan(process_info, focus_pid=50020)
     assert policies == {50020: 0, 50021: 3}
-    now[0] = 120.0
+    assert focused.nice() == 5
+    now[0] = 10.0
     manager.build_priority_plan(process_info, focus_pid=50020)
     assert trim_calls == [50021]
     assert manager.working_set_trimmed_bytes == 4 * 1024 * 1024
+    assert manager.suspend_after_seconds == 120
+    assert manager.suspended_count == 0
 
     active_pid[0] = 50021
     manager.build_priority_plan(process_info, focus_pid=50021)
     assert policies[50021] == 0
     assert (50021, 0) in scheduler_calls
+    assert focused.nice() == 0
     assert manager.restore_all() == []
 
 
