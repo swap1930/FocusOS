@@ -7,3 +7,6 @@ bin/
 lib/
 include/
 pip-wheel-metadata/
+.env
+.env.*
+!.env.example

@@ -30,6 +30,7 @@ from PySide6.QtQuickControls2 import QQuickStyle
 
 from config.settings import RESOURCE_PROFILES
 from core.focus_runtime import FocusRuntime
+from ai.terminal import Suggestion, TerminalService, filesystem_path
 
 
 QML_DIR = Path(__file__).resolve().parent / "qml"
@@ -250,6 +251,12 @@ class DashboardBackend(QObject):
     request_resource_profile = Signal(str)
     request_clean_disk = Signal()
     request_ml_power_mode = Signal(bool, int)
+    terminalSuggestionsChanged = Signal()
+    terminalOutputChanged = Signal()
+    terminalBusyChanged = Signal()
+    terminalConfirmationRequested = Signal(str)
+    terminalHistoryChanged = Signal()
+    terminalWorkingDirectoryChanged = Signal()
 
     def __init__(self, runtime: Optional[FocusRuntime] = None):
         super().__init__()
@@ -268,6 +275,12 @@ class DashboardBackend(QObject):
         self._closing = False
         self._shutdown_complete = False
         self._dark = False
+        self.terminal = TerminalService()
+        self._terminal_suggestions: List[Dict[str, str]] = []
+        self._terminal_output: List[Dict[str, Any]] = []
+        self._terminal_busy = False
+        self._terminal_sequence = 0
+        self._terminal_ai_worker.connect(self._finish_terminal_ai_result)
 
         self._plan_model = RowsModel(self)
         self._memory_model = RowsModel(self)
@@ -316,6 +329,159 @@ class DashboardBackend(QObject):
     @Property(bool, notify=darkModeChanged)
     def darkMode(self) -> bool:
         return self._dark
+
+    @Property("QVariantList", notify=terminalSuggestionsChanged)
+    def terminalSuggestions(self) -> List[Dict[str, str]]:
+        return self._terminal_suggestions
+
+    @Property("QVariantList", notify=terminalOutputChanged)
+    def terminalOutput(self) -> List[Dict[str, str]]:
+        return self._terminal_output
+
+    @Property(bool, notify=terminalBusyChanged)
+    def terminalBusy(self) -> bool:
+        return self._terminal_busy
+
+    @Property(bool, constant=True)
+    def terminalAIAvailable(self) -> bool:
+        return self.terminal.ai_available
+
+    @Property(str, constant=True)
+    def terminalPlatform(self) -> str:
+        return self.runtime.platform
+
+    @Slot(str)
+    def terminalSuggest(self, partial: str) -> None:
+        self.terminal.invalidate_ai()
+        self._terminal_sequence += 1
+        self._terminal_suggestions = [
+            {"command": item.command, "explanation": item.explanation, "source": item.source}
+            for item in self.terminal.suggestions(partial)
+        ]
+        self.terminalSuggestionsChanged.emit()
+        if self.terminal.ai_available and partial.strip():
+            self._terminal_busy = True
+            self.terminalBusyChanged.emit()
+            sequence = self._terminal_sequence
+            def completed(items: List[Suggestion]) -> None:
+                self._terminal_ai_worker.emit(sequence, items)
+            self.terminal.request_ai(partial, "", completed)
+
+    _terminal_ai_worker = Signal(int, object)
+
+
+    @Slot(int, object)
+    def _finish_terminal_ai_result(self, sequence: int, items: object) -> None:
+        if sequence != self._terminal_sequence:
+            return
+        self._terminal_busy = False
+        local = self.terminal.suggestions("")
+        self._terminal_suggestions = [
+            {"command": item.command, "explanation": item.explanation, "source": item.source}
+            for item in local
+        ]
+        self._terminal_suggestions.extend(
+            {"command": item.command, "explanation": item.explanation, "source": item.source}
+            for item in (items if isinstance(items, list) else [])
+        )
+        self._terminal_suggestions = self._terminal_suggestions[:15]
+        self.terminalBusyChanged.emit()
+        self.terminalSuggestionsChanged.emit()
+
+    @Slot(str)
+    def terminalRun(self, command: str) -> None:
+        if self._closing:
+            return
+        ai_suggestion = any(
+            item.get("command") == command and item.get("source") == "ai"
+            for item in self._terminal_suggestions
+        )
+        if ai_suggestion:
+            self.terminalConfirmationRequested.emit(command)
+            return
+        self._execute_terminal_command(command)
+
+    @Slot(str)
+    def terminalConfirmAI(self, command: str) -> None:
+        if self._closing:
+            return
+        is_current_ai = any(
+            item.get("command") == command and item.get("source") == "ai"
+            for item in self._terminal_suggestions
+        )
+        if not is_current_ai:
+            return
+        if self.terminal.execute(command, confirmed=False).get("confirmation_required"):
+            self._append_terminal_result(command, {
+                "ok": False,
+                "stdout": "",
+                "stderr": "This AI-suggested command is blocked by the terminal's safety policy.",
+            })
+            return
+        result = self.terminal.execute(command, confirmed=True)
+        self._append_terminal_result(command, result)
+
+    def _execute_terminal_command(self, command: str) -> None:
+        is_ai_suggestion = any(
+            item.get("command") == command and item.get("source") == "ai"
+            for item in self._terminal_suggestions
+        )
+        result = self.terminal.execute(command, confirmed=not is_ai_suggestion)
+        self._append_terminal_result(command, result)
+
+    def _append_terminal_result(self, command: str, result: Dict[str, Any]) -> None:
+        self._terminal_output.append({
+            "command": command,
+            "stdout": str(result.get("stdout", ""))[:16000],
+            "stderr": str(result.get("stderr", ""))[:16000],
+            "returncode": int(result.get("returncode", -1)),
+            "ok": bool(result.get("ok")),
+        })
+        self._terminal_output = self._terminal_output[-100:]
+        self.terminalOutputChanged.emit()
+        self.terminalHistoryChanged.emit()
+        if result.get("cwd"):
+            self.terminalWorkingDirectoryChanged.emit()
+
+    @Property("QVariantList", notify=terminalHistoryChanged)
+    def terminalHistory(self) -> List[str]:
+        return self.terminal.history
+
+    @Slot()
+    def terminalClear(self) -> None:
+        self._terminal_output = []
+        self.terminalOutputChanged.emit()
+
+    @Property(str, notify=terminalWorkingDirectoryChanged)
+    def terminalWorkingDirectory(self) -> str:
+        return self.terminal.cwd
+
+    @Slot(str, result=bool)
+    def terminalSetWorkingDirectory(self, path: str) -> bool:
+        if self._closing:
+            return False
+        try:
+            selected_url = QUrl(path)
+            if selected_url.isValid() and selected_url.scheme().casefold() == "file":
+                path = selected_url.toLocalFile()
+            selected = filesystem_path(path).resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        if not selected.is_dir():
+            return False
+        self.terminal.cwd = str(selected)
+        self.terminal.invalidate_ai()
+        self._terminal_suggestions = []
+        self.terminalSuggestionsChanged.emit()
+        self.terminalWorkingDirectoryChanged.emit()
+        self._append_terminal_result("cd " + str(selected), {
+            "ok": True,
+            "stdout": str(selected),
+            "stderr": "",
+            "returncode": 0,
+            "cwd": str(selected),
+        })
+        return True
 
 
     @Property(str, constant=True)
