@@ -11,6 +11,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import threading
 
 from PySide6.QtCore import (
     QAbstractListModel,
@@ -280,7 +281,9 @@ class DashboardBackend(QObject):
         self._terminal_output: List[Dict[str, Any]] = []
         self._terminal_busy = False
         self._terminal_sequence = 0
+        self._terminal_request_sequence = 0
         self._terminal_ai_worker.connect(self._finish_terminal_ai_result)
+        self._terminal_request_worker.connect(self._execute_terminal_request, Qt.ConnectionType.QueuedConnection)
 
         self._plan_model = RowsModel(self)
         self._memory_model = RowsModel(self)
@@ -368,7 +371,7 @@ class DashboardBackend(QObject):
             self.terminal.request_ai(partial, "", completed)
 
     _terminal_ai_worker = Signal(int, object)
-
+    _terminal_request_worker = Signal(int, str, object)
 
     @Slot(int, object)
     def _finish_terminal_ai_result(self, sequence: int, items: object) -> None:
@@ -388,18 +391,99 @@ class DashboardBackend(QObject):
         self.terminalBusyChanged.emit()
         self.terminalSuggestionsChanged.emit()
 
+    @Slot(str, result=bool)
+    def terminalIsCommand(self, text: str) -> bool:
+        args, error = self.terminal.validate(text.strip())
+        return args is not None and not error
+
+    @Slot(str)
+    def terminalCommandSubmitted(self, prompt: str) -> None:
+        clean = prompt.strip()
+        if clean:
+            self.terminal.history.append(clean)
+            self.terminal.history = self.terminal.history[-200:]
+            self.terminalHistoryChanged.emit()
+
     @Slot(str)
     def terminalRun(self, command: str) -> None:
         if self._closing:
             return
-        ai_suggestion = any(
-            item.get("command") == command and item.get("source") == "ai"
-            for item in self._terminal_suggestions
-        )
-        if ai_suggestion:
-            self.terminalConfirmationRequested.emit(command)
+        clean = command.strip()
+        if not clean:
             return
-        self._execute_terminal_command(command)
+        self._terminal_request_sequence += 1
+        args, error = self.terminal.validate(clean)
+        if args is not None and not error:
+            ai_suggestion = any(
+                item.get("command") == clean and item.get("source") == "ai"
+                for item in self._terminal_suggestions
+            )
+            if ai_suggestion:
+                self.terminalConfirmationRequested.emit(clean)
+                return
+            self._execute_terminal_command(clean)
+            return
+        if len(clean) > 1024:
+            self._append_terminal_result(clean, {
+                "ok": False,
+                "stdout": "",
+                "stderr": "Request is too long (maximum 1024 characters).",
+                "returncode": -1,
+            })
+            return
+        sequence = self._terminal_request_sequence
+        self._terminal_busy = True
+        self.terminalBusyChanged.emit()
+        self._terminal_suggestions = []
+        self.terminalSuggestionsChanged.emit()
+
+        def work() -> None:
+            try:
+                result = self.terminal.generate_ai_assistant_commands(clean)
+            except Exception as exc:
+                result = {"ok": False, "error": f"Could not generate a command: {exc}"}
+            self._terminal_request_worker.emit(sequence, clean, result)
+
+        threading.Thread(target=work, daemon=True, name="FocusOS-terminal-request").start()
+
+    @Slot(int, str, object)
+    def _execute_terminal_request(self, sequence: int, prompt: str, result: object) -> None:
+        if sequence != self._terminal_request_sequence or self._closing:
+            return
+        self._terminal_busy = False
+        self.terminalBusyChanged.emit()
+        response = result if isinstance(result, dict) else {}
+        commands = response.get("commands", [])
+        steps = response.get("steps", [])
+        if not response.get("ok") or not isinstance(commands, list) or not commands:
+            self._append_terminal_result(prompt, {
+                "ok": False,
+                "stdout": "",
+                "stderr": str(response.get("error", "No safe command was generated for that request.")),
+                "returncode": -1,
+            })
+            return
+        for index, command in enumerate(commands[:3]):
+            if not isinstance(command, str):
+                continue
+            args, error = self.terminal.validate(command)
+            if args is None or error:
+                self._append_terminal_result(prompt, {
+                    "ok": False,
+                    "stdout": "",
+                    "stderr": "The generated command was blocked by the terminal safety policy.",
+                    "returncode": -1,
+                })
+                return
+            result_row = self.terminal.execute(command, confirmed=True)
+            step = steps[index] if index < len(steps) and isinstance(steps[index], dict) else {}
+            description = str(step.get("description", "")).strip()
+            displayed_command = f"{prompt} → {command}" if index == 0 else command
+            if description and not result_row.get("stderr"):
+                result_row["stdout"] = (description + "\n" + str(result_row.get("stdout", ""))).strip()
+            self._append_terminal_result(displayed_command, result_row)
+            if not result_row.get("ok"):
+                break
 
     @Slot(str)
     def terminalConfirmAI(self, command: str) -> None:

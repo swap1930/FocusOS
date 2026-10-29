@@ -20,6 +20,9 @@ Card {
     function updateSuggestions() {
         suggestionTimer.restart()
     }
+    function updateOutputScroll() {
+        outputScrollTimer.restart()
+    }
     function acceptSelectedSuggestion() {
         if (selectedIndex >= 0 && selectedIndex < suggestions.length) {
             commandText = suggestions[selectedIndex].command
@@ -35,7 +38,9 @@ Card {
         if (commandText.trim().length === 0) return
         var command = commandText.trim()
         historyIndex = -1
+        var isCommand = backend.terminalIsCommand(command)
         backend.terminalRun(command)
+        if (!isCommand) backend.terminalCommandSubmitted(command)
         commandText = ""
         selectedIndex = -1
         updateSuggestions()
@@ -46,6 +51,12 @@ Card {
         interval: 240
         repeat: false
         onTriggered: backend.terminalSuggest(root.commandText)
+    }
+    Timer {
+        id: outputScrollTimer
+        interval: 40
+        repeat: false
+        onTriggered: if (outputView.count > 0) outputView.positionViewAtEnd()
     }
 
     ColumnLayout {
@@ -131,7 +142,7 @@ Card {
                         wrapMode: Text.Wrap
                     }
                 }
-                onCountChanged: if (count > 0) positionViewAtEnd()
+                onCountChanged: root.updateOutputScroll()
             }
         }
 
@@ -195,7 +206,7 @@ Card {
                         root.selectedIndex = -1
                         root.updateSuggestions()
                     }
-                    placeholderText: root.terminalMode ? "Type a command and press Enter…" : "Type a supported development command…"
+                    placeholderText: root.terminalMode ? "Describe a task or enter a supported command…" : "Type a supported development command…"
                     color: Theme.text
                     placeholderTextColor: Theme.muted
                     font.family: "monospace"
@@ -244,7 +255,7 @@ Card {
         }
         Text {
             text: root.terminalMode
-                  ? "FocusOS terminal · " + root.workingDirectory + " · Allowlisted commands only; general shell execution is disabled."
+                  ? "FocusOS terminal · " + root.workingDirectory + " · AI requests map to allowlisted commands only; general shell execution is disabled."
                   : "Allowlisted commands only, scoped to the FocusOS project directory. AI suggestions require separate confirmation; general shell execution is disabled."
             color: Theme.muted
             font.pixelSize: 11

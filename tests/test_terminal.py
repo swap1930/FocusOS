@@ -145,3 +145,31 @@ def test_huggingface_filters_untrusted_generated_commands():
 def test_platform_interpreter_commands_validate():
     assert validate_command("python --version")[0] == ["python", "--version"]
     assert validate_command("python3 --version")[0] == ["python3", "--version"]
+
+
+def test_natural_language_requests_map_only_to_safe_supported_commands():
+    client = HuggingFaceSuggester(token="", model_id="")
+    result = client.generate_assistant_commands("please check git status", ".", "linux", "bash")
+    assert result["ok"]
+    assert result["commands"] == ["git status"]
+
+    listing = client.generate_assistant_commands("show me the files in this folder", ".", "windows", "powershell")
+    assert listing["ok"]
+    assert listing["commands"] == ["dir"]
+
+    unsupported = client.generate_assistant_commands("delete all project files", ".", "windows", "powershell")
+    assert not unsupported["ok"]
+    assert unsupported["commands"] == []
+
+
+def test_ai_assistant_response_filters_commands_with_safety_policy():
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self, limit):
+            return json.dumps([{"generated_text": '[{"command":"git status","explanation":"Check status"},{"command":"git status; whoami","explanation":"unsafe"}]'}]).encode()
+
+    client = HuggingFaceSuggester(token="secret", model_id="model", opener=lambda *a, **k: Response())
+    result = client.generate_assistant_commands("check repository", ".", "linux", "bash")
+    assert result["ok"]
+    assert result["commands"] == ["git status"]

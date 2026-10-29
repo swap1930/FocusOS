@@ -570,6 +570,7 @@ class HuggingFaceSuggester:
         self.timeout = min(max(float(timeout), 0.1), AI_TIMEOUT_SECONDS)
         self.opener = opener
         self._cache: OrderedDict[tuple[str, str], list[Suggestion]] = OrderedDict()
+        self._assistant_cache: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
 
     @property
     def available(self) -> bool:
@@ -583,12 +584,15 @@ class HuggingFaceSuggester:
             self._cache.move_to_end(key)
             return list(self._cache[key])
         endpoint = self.api_url or f"https://router.huggingface.co/hf-inference/models/{self.model_id}"
+        natural_language = intent.strip() or partial.strip()
         prompt = (
-            "Return at most 3 safe local development command suggestions as a JSON array "
-            'of objects with "command" and "explanation". No markdown, shell chaining, '
-            "destructive, elevated, or package mutation commands. "
-            f"OS/shell: {platform}. Project directory: {Path(cwd).name}. "
-            f"Intent: {intent[:160]}. Partial command: {partial[:240]}"
+            "Translate the user's natural-language request into at most 3 safe, read-only "
+            "local development terminal commands. Return ONLY a JSON array of objects with "
+            '"command" and "explanation". No markdown, shell chaining, scripts, '
+            "destructive actions, network changes, or package installation. If the request "
+            "cannot be fulfilled safely, return an empty array. "
+            f"OS/shell: {platform}. Working directory: {Path(cwd).name}. "
+            f"User request: {natural_language[:240]}"
         )
         payload = json.dumps({"inputs": prompt, "parameters": {"max_new_tokens": 160, "return_full_text": False}}).encode()
         request = urllib.request.Request(
@@ -638,18 +642,25 @@ class HuggingFaceSuggester:
     ) -> dict[str, Any]:
         """Generate multi-step shell commands for a natural language user request."""
         clean_prompt = prompt.strip()
-        if not clean_prompt:
-            return {"ok": False, "error": "Prompt cannot be empty.", "steps": [], "commands": []}
+        if not clean_prompt or len(clean_prompt) > MAX_COMMAND_LENGTH:
+            return {"ok": False, "error": "Enter a request under 1024 characters.", "steps": [], "commands": []}
+        cache_key = (clean_prompt.casefold(), platform.casefold())
+        if cache_key in self._assistant_cache:
+            self._assistant_cache.move_to_end(cache_key)
+            return dict(self._assistant_cache[cache_key])
 
         # Check Hugging Face first if available
         if self.available:
             endpoint = self.api_url or f"https://router.huggingface.co/hf-inference/models/{self.model_id}"
             instruction = (
-                f"You are a DevOps assistant. Generate precise shell commands for {platform} using {shell} "
-                f"in working directory {cwd}. User request: \"{clean_prompt}\".\n"
-                "Respond ONLY with a JSON array of objects with keys: \"step\" (integer), "
-                "\"command\" (string to run), \"description\" (short explanation). "
-                "No markdown, no backticks, no markdown formatting."
+                f"You are a careful assistant for a restricted development terminal on {platform} "
+                f"using {shell}, in working directory {Path(cwd).name}. User request: "
+                f"\"{clean_prompt[:240]}\". Return ONLY a JSON array with one object "
+                'containing "command" and "explanation". Use exactly one read-only command '
+                "from this set: git status, git diff, git log, git branch, pwd, ls -la, dir, "
+                "python --version, pytest -v. Do not return shell scripts, operators, package "
+                "changes, file changes, network commands, or destructive commands. If no "
+                "listed command satisfies the request, return []."
             )
             payload = json.dumps(
                 {"inputs": instruction, "parameters": {"max_new_tokens": 300, "return_full_text": False}}
@@ -671,51 +682,98 @@ class HuggingFaceSuggester:
                     if isinstance(data, dict)
                     else ""
                 )
-                match = re.search(r"\[\s*\{.*\}\s*\]", text, re.DOTALL)
+                match = re.search(r"\[.*\]", text, re.DOTALL)
                 if match:
                     parsed_steps = json.loads(match.group(0))
-                    if isinstance(parsed_steps, list) and parsed_steps:
-                        steps = []
-                        commands = []
-                        is_destructive = False
-                        for idx, item in enumerate(parsed_steps, 1):
-                            cmd = item.get("command", "").strip()
-                            desc = item.get("description", "Execute step")
-                            if cmd:
-                                if is_destructive_command(cmd):
-                                    is_destructive = True
-                                steps.append({"step": idx, "command": cmd, "description": desc})
-                                commands.append(cmd)
-                        if commands:
-                            warning = (
-                                "Destructive operations detected! Files or configuration may be permanently altered."
-                                if is_destructive
-                                else ""
-                            )
-                            return {
+                    if isinstance(parsed_steps, list):
+                        safe_steps = []
+                        for item in parsed_steps[:3]:
+                            if not isinstance(item, dict):
+                                continue
+                            command = item.get("command")
+                            explanation = item.get("explanation", "AI suggestion; review before execution")
+                            if not isinstance(command, str) or not isinstance(explanation, str):
+                                continue
+                            args, error = validate_command(command)
+                            if args is not None and not error:
+                                safe_steps.append({
+                                    "step": len(safe_steps) + 1,
+                                    "command": command,
+                                    "description": explanation[:180],
+                                })
+                        if safe_steps:
+                            commands = [item["command"] for item in safe_steps]
+                            result = {
                                 "ok": True,
                                 "prompt": clean_prompt,
                                 "commands": commands,
-                                "steps": steps,
-                                "is_destructive": is_destructive,
-                                "warning": warning,
+                                "steps": safe_steps,
+                                "is_destructive": False,
+                                "warning": "",
                                 "source": "hf",
                             }
+                            self._assistant_cache[cache_key] = dict(result)
+                            if len(self._assistant_cache) > 64:
+                                self._assistant_cache.popitem(last=False)
+                            return result
             except Exception:
                 pass  # Fall through to robust local heuristic generator
 
         # Smart local heuristic generator for offline & reliable operation
-        return self._generate_heuristic_commands(clean_prompt, cwd, platform, shell)
+        result = self._generate_heuristic_commands(clean_prompt, cwd, platform, shell)
+        if result.get("ok") and result.get("commands"):
+            safe_commands = []
+            for command in result["commands"][:3]:
+                args, error = validate_command(command)
+                if args is not None and not error:
+                    safe_commands.append(command)
+            if safe_commands:
+                result["commands"] = safe_commands
+                result["steps"] = [
+                    {"step": index, "command": command, "description": "Run the matching safe terminal command"}
+                    for index, command in enumerate(safe_commands, 1)
+                ]
+                self._assistant_cache[cache_key] = dict(result)
+                if len(self._assistant_cache) > 64:
+                    self._assistant_cache.popitem(last=False)
+                return result
+        result = {"ok": False, "error": "I couldn't map that request to a supported safe command. Try asking to list files, show the current directory, or check repository status.", "steps": [], "commands": []}
+        self._assistant_cache[cache_key] = dict(result)
+        if len(self._assistant_cache) > 64:
+            self._assistant_cache.popitem(last=False)
+        return result
 
     def _generate_heuristic_commands(
         self, prompt: str, cwd: str, platform: str, shell: str
     ) -> dict[str, Any]:
         """Reliable rule-based generator for development requests."""
         p_lower = prompt.casefold()
+        if any(term in p_lower for term in (
+            "delete", "remove", "erase", "format", "overwrite", "modify", "change file",
+            "edit file", "write file", "install", "uninstall", "commit", "push", "pull",
+            "create", "generate", "build", "deploy", "shutdown", "kill process",
+        )):
+            return {
+                "ok": False,
+                "error": "This request could change files, system state, or external resources, so the restricted terminal will not run it.",
+                "steps": [],
+                "commands": [],
+            }
         steps = []
         commands = []
         is_windows = platform.casefold().startswith("win") or sys.platform == "win32"
         is_ps = "power" in shell.casefold()
+        if any(term in p_lower for term in (
+            "delete", "remove", "erase", "format", "overwrite", "modify", "change file",
+            "edit file", "write file", "install", "uninstall", "commit", "push", "pull",
+            "create", "generate", "build", "deploy", "shutdown", "kill process",
+        )):
+            return {
+                "ok": False,
+                "error": "This request could change files, system state, or external resources, so the restricted terminal will not run it.",
+                "steps": [],
+                "commands": [],
+            }
 
         if "virtual environment" in p_lower or "venv" in p_lower:
             py = "python" if is_windows else "python3"
@@ -734,7 +792,7 @@ class HuggingFaceSuggester:
                 commands.append("pip install -r requirements.txt")
 
         elif "test" in p_lower or "pytest" in p_lower:
-            cmd = "pytest -v"
+            cmd = "git status" if "run" not in p_lower and "execute" not in p_lower and "check" not in p_lower else "pytest -v"
             steps.append({"step": 1, "command": cmd, "description": "Run the test suite with verbose output"})
             commands.append(cmd)
 
@@ -745,32 +803,44 @@ class HuggingFaceSuggester:
                 steps.append({"step": 2, "command": "git diff", "description": "Inspect unstaged file changes"})
                 commands.append("git diff")
 
-        elif "commit" in p_lower:
-            steps.append({"step": 1, "command": "git add .", "description": "Stage all modified files"})
-            commands.append("git add .")
-            steps.append({"step": 2, "command": 'git commit -m "Update FocusOS components"', "description": "Commit staged changes"})
-            commands.append('git commit -m "Update FocusOS components"')
 
-        elif "install" in p_lower and "package" in p_lower:
-            target = "requests"
-            for word in prompt.split():
-                if word not in {"install", "package", "packages", "and", "a", "the", "pip"}:
-                    target = word
-                    break
-            cmd = f"pip install {target}"
-            steps.append({"step": 1, "command": cmd, "description": f"Install package {target}"})
-            commands.append(cmd)
-
-        elif "list" in p_lower or "dir" in p_lower or "files" in p_lower:
+        elif any(word in p_lower for word in ("list", "directory", "folder", "files", "contents", "show me what's in", "what is in")):
             cmd = "dir" if is_windows else "ls -la"
             steps.append({"step": 1, "command": cmd, "description": "List files in the current working directory"})
             commands.append(cmd)
 
-        else:
-            # General fallback command based on prompt
-            cmd = prompt
-            steps.append({"step": 1, "command": cmd, "description": "Execute requested command"})
+        elif any(word in p_lower for word in ("current directory", "working directory", "where am i", "current folder", "show path", "what path", "print path")):
+            steps.append({"step": 1, "command": "pwd", "description": "Show the current working directory"})
+            commands.append("pwd")
+
+        elif "git" in p_lower and any(word in p_lower for word in ("branch", "branches")):
+            steps.append({"step": 1, "command": "git branch", "description": "List local Git branches"})
+            commands.append("git branch")
+
+        elif "git" in p_lower and any(word in p_lower for word in ("history", "commits", "log", "recent")):
+            steps.append({"step": 1, "command": "git log", "description": "Show recent Git commits"})
+            commands.append("git log")
+
+        elif "git" in p_lower and any(word in p_lower for word in ("diff", "changes", "changed files")):
+            steps.append({"step": 1, "command": "git diff", "description": "Show unstaged Git changes"})
+            commands.append("git diff")
+
+        elif "python" in p_lower and any(word in p_lower for word in ("version", "installed")):
+            cmd = "python --version" if is_windows else "python3 --version"
+            steps.append({"step": 1, "command": cmd, "description": "Show the Python version"})
             commands.append(cmd)
+
+        elif any(word in p_lower for word in ("repository", "repo", "git")) and any(word in p_lower for word in ("status", "check", "clean", "changes")):
+            steps.append({"step": 1, "command": "git status", "description": "Inspect repository working tree"})
+            commands.append("git status")
+
+        else:
+            return {
+                "ok": False,
+                "error": "I couldn't map that request to a supported safe command. Try asking to list files, show the current directory, check Git status, view recent commits, or run tests.",
+                "steps": [],
+                "commands": [],
+            }
 
         is_destr = any(is_destructive_command(c) for c in commands)
         warning = "Caution: Destructive command detected! This action may alter or delete files." if is_destr else ""
@@ -890,6 +960,10 @@ class TerminalService:
     def clear(self) -> None:
         with self._lock:
             self.output_buffer.clear()
+
+    @staticmethod
+    def validate(command: str) -> tuple[list[str] | None, str]:
+        return validate_command(command)
 
     def execute(self, command: str, confirmed: bool = False) -> dict[str, Any]:
         """Legacy direct executor for unit tests."""
