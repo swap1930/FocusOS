@@ -31,7 +31,7 @@ from PySide6.QtQuickControls2 import QQuickStyle
 
 from config.settings import RESOURCE_PROFILES
 from core.focus_runtime import FocusRuntime
-from ai.terminal import Suggestion, TerminalService, filesystem_path
+from ai.terminal import Suggestion, TerminalService, _validate_ai_navigation, filesystem_path
 
 
 QML_DIR = Path(__file__).resolve().parent / "qml"
@@ -391,18 +391,6 @@ class DashboardBackend(QObject):
         self.terminalBusyChanged.emit()
         self.terminalSuggestionsChanged.emit()
 
-    @Slot(str, result=bool)
-    def terminalIsCommand(self, text: str) -> bool:
-        args, error = self.terminal.validate(text.strip())
-        return args is not None and not error
-
-    @Slot(str)
-    def terminalCommandSubmitted(self, prompt: str) -> None:
-        clean = prompt.strip()
-        if clean:
-            self.terminal.history.append(clean)
-            self.terminal.history = self.terminal.history[-200:]
-            self.terminalHistoryChanged.emit()
 
     @Slot(str)
     def terminalRun(self, command: str) -> None:
@@ -432,6 +420,10 @@ class DashboardBackend(QObject):
             })
             return
         sequence = self._terminal_request_sequence
+        if clean not in self.terminal.history:
+            self.terminal.history.append(clean)
+        self.terminal.history = self.terminal.history[-200:]
+        self.terminalHistoryChanged.emit()
         self._terminal_busy = True
         self.terminalBusyChanged.emit()
         self._terminal_suggestions = []
@@ -467,7 +459,12 @@ class DashboardBackend(QObject):
             if not isinstance(command, str):
                 continue
             args, error = self.terminal.validate(command)
-            if args is None or error:
+            is_natural_navigation = (
+                index == 0
+                and isinstance(response.get("prompt"), str)
+                and _validate_ai_navigation(command, response["prompt"], self.terminal.cwd)
+            )
+            if (args is None or error) and not is_natural_navigation:
                 self._append_terminal_result(prompt, {
                     "ok": False,
                     "stdout": "",
@@ -475,7 +472,19 @@ class DashboardBackend(QObject):
                     "returncode": -1,
                 })
                 return
-            result_row = self.terminal.execute(command, confirmed=True)
+            if command.casefold().startswith("cd "):
+                result_row = self.terminal.execute(command, confirmed=True)
+                if result_row.get("ok") and result_row.get("cwd"):
+                    success, error_text = self.terminal.set_cwd(result_row["cwd"])
+                    if not success:
+                        result_row = {
+                            "ok": False,
+                            "stdout": "",
+                            "stderr": error_text or "Could not change the terminal working directory.",
+                            "returncode": -1,
+                        }
+            else:
+                result_row = self.terminal.execute(command, confirmed=True)
             step = steps[index] if index < len(steps) and isinstance(steps[index], dict) else {}
             description = str(step.get("description", "")).strip()
             displayed_command = f"{prompt} → {command}" if index == 0 else command

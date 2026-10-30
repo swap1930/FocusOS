@@ -2,7 +2,7 @@
 
 Provides genuine interactive shell sessions (using PTY on Windows and Unix),
 native working directory selection, real-time autocomplete suggestions,
-and Hugging Face-powered natural-language command generation with multi-step
+and Cohere-powered natural-language command generation with multi-step
 previews, confirmation, editing, and safety validation.
 """
 
@@ -28,9 +28,49 @@ from urllib.parse import unquote, urlparse
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
 except ImportError:
-    pass
+    load_dotenv = None
+
+
+def _load_terminal_environment() -> None:
+    if load_dotenv is not None:
+        load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
+
+
+def _cohere_response_text(data: Any) -> str:
+    """Extract the text content from Cohere's v2 chat response."""
+    if not isinstance(data, dict):
+        return ""
+    message = data.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, list):
+        return "".join(
+            item.get("text", "")
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)
+        )
+    return ""
+
+
+def _cohere_http_error_detail(error: urllib.error.HTTPError) -> str:
+    """Read a bounded provider error message without exposing request headers."""
+    try:
+        body = error.read(4096).decode("utf-8", errors="replace")
+        data = json.loads(body)
+        if isinstance(data, dict):
+            detail = data.get("message") or data.get("error")
+            if isinstance(detail, dict):
+                detail = detail.get("message") or detail.get("type")
+            if isinstance(detail, str):
+                safe_detail = re.sub(r"\s+", " ", detail)[:240]
+                return safe_detail
+        if isinstance(data, str):
+            safe_detail = re.sub(r"\s+", " ", data)[:240]
+            return safe_detail
+    except (OSError, ValueError, TypeError):
+        pass
+    return "Cohere rejected the request; check API key, model, and account limits"
+
 
 try:
     import winpty
@@ -45,7 +85,7 @@ MAX_COMMAND_LENGTH = 1024
 MAX_OUTPUT_CHARS = 100_000
 MAX_HISTORY = 200
 DEFAULT_TIMEOUT_SECONDS = 15
-AI_TIMEOUT_SECONDS = 5
+AI_TIMEOUT_SECONDS = 30
 
 LOCAL_COMMANDS = (
     ("git status", "Show the working tree status"),
@@ -238,6 +278,86 @@ def validate_command(command: str) -> tuple[list[str] | None, str]:
     if root == "cd" and len(args) > 2:
         return None, "Use cd with at most one child directory."
     return args, ""
+
+
+def _validate_ai_navigation(command: str, prompt: str, cwd: str | os.PathLike[str]) -> bool:
+    """Accept only a cd command that matches the user's explicit folder request."""
+    if not isinstance(command, str) or len(command) > MAX_COMMAND_LENGTH:
+        return False
+    if not re.match(r"^\s*cd(?:\s|$)", command, re.IGNORECASE):
+        return False
+    if any(char in command for char in "\n\r\x00;&|<>`"):
+        return False
+    try:
+        match = re.fullmatch(r'\s*cd\s+"([^"]+)"\s*', command, re.IGNORECASE)
+        if match:
+            args = ["cd", match.group(1)]
+        elif os.name == "nt":
+            args = shlex.split(command, posix=False)
+        else:
+            args = shlex.split(command, posix=True)
+        if len(args) != 2 or args[0].casefold() != "cd":
+            return False
+        if not match and os.name == "nt" and len(args[1]) > 1 and args[1][1] == ":" and not args[1][2:3] in {"\\", "/"}:
+            return False
+        destination = args[1].strip('"\'')
+        if destination in {".", ".."} or Path(destination).name in {".", ".."}:
+            return False
+
+        if re.fullmatch(r"[A-Za-z]:[\\/]?", destination):
+            return False
+        requested = filesystem_path(destination).expanduser()
+        if os.name == "nt" and not requested.is_absolute():
+            requested = _safe_cwd(cwd) / requested
+        elif not requested.is_absolute():
+            requested = _safe_cwd(cwd) / requested
+        target = requested.resolve(strict=True)
+        if not target.is_dir() or not os.access(target, os.R_OK | os.X_OK):
+            return False
+        normalized_prompt = prompt.casefold()
+        navigation_intent = re.search(r"\b(?:cd|chdir|navigate|go|move|switch|open)\b", normalized_prompt)
+        if not navigation_intent:
+            return False
+        prompt_path = prompt.strip().strip('"\'')
+        match_prompt = re.fullmatch(
+            r"(?:please\s+)?(?:cd|chdir|navigate|go|move|switch|open)\s+(?:to\s+)?(?:the\s+)?(?:folder|directory)\s+(.+?)\s*[.!]?",
+            prompt_path,
+            re.IGNORECASE,
+        )
+        if match_prompt:
+            prompt_path = match_prompt.group(1).strip().strip('"\'')
+        else:
+            prompt_match = re.fullmatch(
+                r"(?:please\s+)?(?:cd|chdir|navigate|go|move|switch|open)\s+(?:to\s+)?(.+?)\s*[.!]?",
+                prompt_path,
+                re.IGNORECASE,
+            )
+            if not prompt_match:
+                return False
+            prompt_path = prompt_match.group(1).strip().strip('"\'')
+        if prompt_path in {".", ".."}:
+            return False
+        if not prompt_path:
+            return False
+        requested_prompt_path = filesystem_path(prompt_path).expanduser()
+        if os.name == "nt" and not requested_prompt_path.is_absolute():
+            requested_prompt_path = _safe_cwd(cwd) / requested_prompt_path
+        elif not requested_prompt_path.is_absolute():
+            requested_prompt_path = _safe_cwd(cwd) / requested_prompt_path
+        try:
+            prompt_target = requested_prompt_path.resolve(strict=True)
+            command_target = requested.resolve(strict=True)
+            cwd_target = _safe_cwd(cwd).resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return (
+            prompt_target.is_dir()
+            and prompt_target != cwd_target
+            and prompt_target == command_target
+            and command_target == target
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def execute_command(
@@ -553,28 +673,29 @@ class PTYSession:
             self._master_fd = None
 
 
-class HuggingFaceSuggester:
-    """Hugging Face Inference client for real-time autocomplete and assistant commands."""
+class CohereSuggester:
+    """Cohere chat API client for real-time autocomplete and assistant commands."""
 
     def __init__(
         self,
-        token: str | None = None,
         model_id: str | None = None,
+        api_key: str | None = None,
         api_url: str | None = None,
         timeout: float = AI_TIMEOUT_SECONDS,
         opener: Callable[..., Any] = urllib.request.urlopen,
     ):
-        self.token = (token if token is not None else os.getenv("HF_TOKEN", "")).strip()
-        self.model_id = (model_id if model_id is not None else os.getenv("HF_MODEL_ID", "")).strip()
-        self.api_url = (api_url if api_url is not None else os.getenv("HF_API_URL", "")).strip()
+        _load_terminal_environment()
+        self.api_key = (api_key if api_key is not None else os.getenv("COHERE_API_KEY", "")).strip()
+        self.model_id = (model_id if model_id is not None else os.getenv("COHERE_MODEL", "command-a-03-2025")).strip()
+        self.api_url = (api_url if api_url is not None else os.getenv("COHERE_API_URL", "https://api.cohere.com/v2/chat")).strip()
         self.timeout = min(max(float(timeout), 0.1), AI_TIMEOUT_SECONDS)
         self.opener = opener
         self._cache: OrderedDict[tuple[str, str], list[Suggestion]] = OrderedDict()
-        self._assistant_cache: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+        self._assistant_cache: OrderedDict[tuple[str, str, str], dict[str, Any]] = OrderedDict()
 
     @property
     def available(self) -> bool:
-        return bool(self.token and self.model_id)
+        return bool(self.api_key and self.model_id and self.api_url)
 
     def suggest(self, partial: str, cwd: str, platform: str, intent: str = "") -> list[Suggestion]:
         if not self.available or not partial.strip() or len(partial) > MAX_COMMAND_LENGTH:
@@ -583,38 +704,34 @@ class HuggingFaceSuggester:
         if key in self._cache:
             self._cache.move_to_end(key)
             return list(self._cache[key])
-        endpoint = self.api_url or f"https://router.huggingface.co/hf-inference/models/{self.model_id}"
+        endpoint = self.api_url
         natural_language = intent.strip() or partial.strip()
         prompt = (
-            "Translate the user's natural-language request into at most 3 safe, read-only "
-            "local development terminal commands. Return ONLY a JSON array of objects with "
+            "Translate the user's natural-language request into at most 3 commands from "
+            "the FocusOS terminal's allowlist. Return ONLY a JSON array of objects with "
             '"command" and "explanation". No markdown, shell chaining, scripts, '
             "destructive actions, network changes, or package installation. If the request "
             "cannot be fulfilled safely, return an empty array. "
             f"OS/shell: {platform}. Working directory: {Path(cwd).name}. "
             f"User request: {natural_language[:240]}"
         )
-        payload = json.dumps({"inputs": prompt, "parameters": {"max_new_tokens": 160, "return_full_text": False}}).encode()
+        payload = json.dumps({
+            "model": self.model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "max_tokens": 160,
+        }).encode()
         request = urllib.request.Request(
             endpoint,
             data=payload,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
             method="POST",
         )
         try:
             with self.opener(request, timeout=self.timeout) as response:
                 raw = response.read(16_384)
             decoded = json.loads(raw.decode("utf-8"))
-            text = (
-                decoded[0].get("generated_text", "")
-                if isinstance(decoded, list) and decoded
-                else decoded.get("generated_text", "")
-                if isinstance(decoded, dict)
-                else ""
-            )
+            text = _cohere_response_text(decoded)
             if not isinstance(text, str):
                 return []
             match = re.search(r"\[.*\]", text, re.DOTALL)
@@ -628,152 +745,149 @@ class HuggingFaceSuggester:
                 if not isinstance(command, str) or not isinstance(explanation, str):
                     continue
                 args, error = validate_command(command)
-                if args is not None and not error:
+                navigation = _validate_ai_navigation(command, natural_language, cwd)
+                if (args is not None and not error) or navigation:
                     results.append(Suggestion(command, explanation[:180], "ai"))
             self._cache[key] = results
             if len(self._cache) > 64:
                 self._cache.popitem(last=False)
             return results
+        except urllib.error.HTTPError:
+            return []
         except (urllib.error.URLError, TimeoutError, OSError, ValueError, TypeError, KeyError):
             return []
 
     def generate_assistant_commands(
         self, prompt: str, cwd: str, platform: str, shell: str
     ) -> dict[str, Any]:
-        """Generate multi-step shell commands for a natural language user request."""
+        """Generate a command from the configured language model only."""
         clean_prompt = prompt.strip()
         if not clean_prompt or len(clean_prompt) > MAX_COMMAND_LENGTH:
             return {"ok": False, "error": "Enter a request under 1024 characters.", "steps": [], "commands": []}
-        cache_key = (clean_prompt.casefold(), platform.casefold())
-        if cache_key in self._assistant_cache:
-            self._assistant_cache.move_to_end(cache_key)
-            return dict(self._assistant_cache[cache_key])
+        if not self.available:
+            return {
+                "ok": False,
+                "error": "Cohere is not configured. Set COHERE_API_KEY and verify COHERE_MODEL and COHERE_API_URL.",
+                "steps": [],
+                "commands": [],
+            }
 
-        # Check Hugging Face first if available
-        if self.available:
-            endpoint = self.api_url or f"https://router.huggingface.co/hf-inference/models/{self.model_id}"
-            instruction = (
-                f"You are a careful assistant for a restricted development terminal on {platform} "
-                f"using {shell}, in working directory {Path(cwd).name}. User request: "
-                f"\"{clean_prompt[:240]}\". Return ONLY a JSON array with one object "
-                'containing "command" and "explanation". Use exactly one read-only command '
-                "from this set: git status, git diff, git log, git branch, pwd, ls -la, dir, "
-                "python --version, pytest -v. Do not return shell scripts, operators, package "
-                "changes, file changes, network commands, or destructive commands. If no "
-                "listed command satisfies the request, return []."
-            )
-            payload = json.dumps(
-                {"inputs": instruction, "parameters": {"max_new_tokens": 300, "return_full_text": False}}
-            ).encode()
-            request = urllib.request.Request(
-                endpoint,
-                data=payload,
-                headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"},
-                method="POST",
-            )
-            try:
-                with self.opener(request, timeout=self.timeout) as resp:
-                    raw = resp.read(32_768)
-                data = json.loads(raw.decode("utf-8"))
-                text = (
-                    data[0].get("generated_text", "")
-                    if isinstance(data, list) and data
-                    else data.get("generated_text", "")
-                    if isinstance(data, dict)
-                    else ""
-                )
-                match = re.search(r"\[.*\]", text, re.DOTALL)
-                if match:
-                    parsed_steps = json.loads(match.group(0))
-                    if isinstance(parsed_steps, list):
-                        safe_steps = []
-                        for item in parsed_steps[:3]:
-                            if not isinstance(item, dict):
-                                continue
-                            command = item.get("command")
-                            explanation = item.get("explanation", "AI suggestion; review before execution")
-                            if not isinstance(command, str) or not isinstance(explanation, str):
-                                continue
-                            args, error = validate_command(command)
-                            if args is not None and not error:
-                                safe_steps.append({
-                                    "step": len(safe_steps) + 1,
-                                    "command": command,
-                                    "description": explanation[:180],
-                                })
-                        if safe_steps:
-                            commands = [item["command"] for item in safe_steps]
-                            result = {
-                                "ok": True,
-                                "prompt": clean_prompt,
-                                "commands": commands,
-                                "steps": safe_steps,
-                                "is_destructive": False,
-                                "warning": "",
-                                "source": "hf",
-                            }
-                            self._assistant_cache[cache_key] = dict(result)
-                            if len(self._assistant_cache) > 64:
-                                self._assistant_cache.popitem(last=False)
-                            return result
-            except Exception:
-                pass  # Fall through to robust local heuristic generator
+        endpoint = self.api_url
+        instruction = (
+            f"You are a careful assistant for a restricted development terminal on {platform} "
+            f"using {shell}, in working directory {Path(cwd).name}. User request: "
+            f"{clean_prompt[:240]}\". Return ONLY a JSON array with one object "
+            'containing "command" and "explanation". Output JSON with no markdown. '
+            "Choose a single safe command that directly fulfills the request. Allowed forms: "
+            "git status, git diff, git log, git branch, pwd, ls -la, dir, python --version, "
+            "pytest -v, or cd to the exact existing directory explicitly named by the user. "
+            "Never add shell operators, scripts, package operations, file modifications, "
+            "network commands, or destructive actions. If the request is not supported, "
+            "return an empty JSON array []."
+        )
+        payload = json.dumps({
+            "model": self.model_id,
+            "messages": [
+                {"role": "system", "content": "You generate only safe, allowlisted terminal commands. Return a JSON array with exactly one command object or []."},
+                {"role": "user", "content": instruction},
+            ],
+            "stream": False,
+            "max_tokens": 300,
+            "temperature": 0,
+        }).encode()
+        request = urllib.request.Request(
+            endpoint,
+            data=payload,
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        parsed_steps = None
+        try:
+            with self.opener(request, timeout=self.timeout) as resp:
+                raw = resp.read(32_768)
+            data = json.loads(raw.decode("utf-8"))
+            text = _cohere_response_text(data)
+            match = re.search(r"\[.*\]", text, re.DOTALL)
+            if match:
+                parsed_steps = json.loads(match.group(0))
+                if isinstance(parsed_steps, list) and len(parsed_steps) > 3:
+                    return {
+                        "ok": False,
+                        "error": "The language model returned too many commands; request one task at a time.",
+                        "steps": [],
+                        "commands": [],
+                    }
+                if isinstance(parsed_steps, list):
+                    safe_steps = []
+                    for item in parsed_steps[:3]:
+                        if not isinstance(item, dict):
+                            continue
+                        command = item.get("command")
+                        explanation = item.get("explanation", "AI suggestion; review before execution")
+                        if not isinstance(command, str) or not isinstance(explanation, str):
+                            continue
+                        args, error = validate_command(command)
+                        navigation = _validate_ai_navigation(command, clean_prompt, cwd)
+                        if navigation or ((args is not None and not error) and not command.lstrip().casefold().startswith("cd ")):
+                            safe_steps.append({
+                                "step": len(safe_steps) + 1,
+                                "command": command,
+                                "description": explanation[:180],
+                            })
+                    if safe_steps and len(safe_steps) == len(parsed_steps[:3]):
+                        commands = [item["command"] for item in safe_steps]
+                        result = {
+                            "ok": True,
+                            "prompt": clean_prompt,
+                            "commands": commands,
+                            "steps": safe_steps,
+                            "is_destructive": False,
+                            "warning": "",
+                            "source": "cohere",
+                        }
+                        return result
+        except urllib.error.HTTPError as error:
+            detail = _cohere_http_error_detail(error)
+            if error.code == 401:
+                detail = f"{detail} (replace COHERE_API_KEY in the project .env with a valid, rotated Cohere key)"
+            return {
+                "ok": False,
+                "error": f"The Cohere request failed: HTTP {error.code}: {detail}",
+                "steps": [],
+                "commands": [],
+            }
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, TypeError, KeyError) as error:
+            return {
+                "ok": False,
+                "error": f"The Cohere request failed: {str(error)[:240]}",
+                "steps": [],
+                "commands": [],
+            }
 
-        # Smart local heuristic generator for offline & reliable operation
-        result = self._generate_heuristic_commands(clean_prompt, cwd, platform, shell)
-        if result.get("ok") and result.get("commands"):
-            safe_commands = []
-            for command in result["commands"][:3]:
-                args, error = validate_command(command)
-                if args is not None and not error:
-                    safe_commands.append(command)
-            if safe_commands:
-                result["commands"] = safe_commands
-                result["steps"] = [
-                    {"step": index, "command": command, "description": "Run the matching safe terminal command"}
-                    for index, command in enumerate(safe_commands, 1)
-                ]
-                self._assistant_cache[cache_key] = dict(result)
-                if len(self._assistant_cache) > 64:
-                    self._assistant_cache.popitem(last=False)
-                return result
-        result = {"ok": False, "error": "I couldn't map that request to a supported safe command. Try asking to list files, show the current directory, or check repository status.", "steps": [], "commands": []}
-        self._assistant_cache[cache_key] = dict(result)
-        if len(self._assistant_cache) > 64:
-            self._assistant_cache.popitem(last=False)
-        return result
+        if isinstance(parsed_steps, list) and parsed_steps:
+            return {
+                "ok": False,
+                "error": "Cohere returned a command outside the supported allowlist. Try a supported request (for example, list files, check Git status, or run tests); the command was not executed.",
+                "steps": [],
+                "commands": [],
+            }
+        return {
+            "ok": False,
+            "error": "The language model did not return a valid safe command for this request.",
+            "steps": [],
+            "commands": [],
+        }
 
     def _generate_heuristic_commands(
         self, prompt: str, cwd: str, platform: str, shell: str
     ) -> dict[str, Any]:
         """Reliable rule-based generator for development requests."""
         p_lower = prompt.casefold()
-        if any(term in p_lower for term in (
-            "delete", "remove", "erase", "format", "overwrite", "modify", "change file",
-            "edit file", "write file", "install", "uninstall", "commit", "push", "pull",
-            "create", "generate", "build", "deploy", "shutdown", "kill process",
-        )):
-            return {
-                "ok": False,
-                "error": "This request could change files, system state, or external resources, so the restricted terminal will not run it.",
-                "steps": [],
-                "commands": [],
-            }
         steps = []
         commands = []
         is_windows = platform.casefold().startswith("win") or sys.platform == "win32"
         is_ps = "power" in shell.casefold()
-        if any(term in p_lower for term in (
-            "delete", "remove", "erase", "format", "overwrite", "modify", "change file",
-            "edit file", "write file", "install", "uninstall", "commit", "push", "pull",
-            "create", "generate", "build", "deploy", "shutdown", "kill process",
-        )):
-            return {
-                "ok": False,
-                "error": "This request could change files, system state, or external resources, so the restricted terminal will not run it.",
-                "steps": [],
-                "commands": [],
-            }
+
 
         if "virtual environment" in p_lower or "venv" in p_lower:
             py = "python" if is_windows else "python3"
@@ -862,11 +976,11 @@ class TerminalService:
     def __init__(
         self,
         cwd: str | None = None,
-        suggester: HuggingFaceSuggester | None = None,
+        suggester: CohereSuggester | None = None,
         on_output: Callable[[str], None] | None = None,
     ):
         self.cwd = str(_safe_cwd(cwd))
-        self.suggester = suggester or HuggingFaceSuggester()
+        self.suggester = suggester or CohereSuggester()
         self.history: list[str] = []
         self._suggestion_id = 0
         self._lock = threading.Lock()

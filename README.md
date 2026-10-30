@@ -45,26 +45,26 @@ at an empty selection navigates command history), Tab to fill a suggestion,
 Enter to accept a highlighted suggestion or execute input, and Escape to dismiss
 suggestions. Suggested commands are never executed automatically.
 
-Optional Hugging Face text-generation assistance is configured using environment
-variables (or a local, git-ignored `.env` file):
+Optional Cohere assistance is configured using environment variables (or a
+local, git-ignored `.env` file):
 
 ```text
-HF_TOKEN=your_hugging_face_token
-HF_MODEL_ID=your_text_generation_model
-HF_API_URL=
+COHERE_API_KEY=your_cohere_api_key
+COHERE_MODEL=command-a-03-2025
+COHERE_API_URL=https://api.cohere.com/v2/chat
 ```
 
-Export these variables in the environment before launching FocusOS (a `.env`
-file is ignored by Git but is not automatically loaded by the desktop entry
-point). HF_API_URL is optional; without it FocusOS uses the Hugging
-Face Inference Router URL for the configured model. The configured model must
-support text generation through that provider endpoint. FocusOS sends a short
-prompt containing the partial command, platform, project directory name, and
-intent. No token is sent to QML or the frontend, and credentials are never
-included in the app's visible output. AI output is parsed as concise JSON and
-filtered through the same command allowlist; malformed responses and network,
-timeout, authentication, and provider errors silently fall back to local
-suggestions.
+Natural-language terminal requests require `COHERE_API_KEY` in the project-root
+`.env` file. `.env.example` is only a template and is not loaded by the app. Do
+not commit the key. If you receive HTTP 401, replace it with a valid key from
+Cohere; revoke any key previously shared publicly. `COHERE_MODEL` and
+`COHERE_API_URL` can be overridden if you use a different Cohere model or endpoint. Prompts containing the user's
+request, platform, and working directory are sent to Cohere. The API key is sent
+only in the authorization header and is never exposed to QML/frontend or visible
+output. Model output is parsed and validated against FocusOS's restricted
+command policy and requires confirmation before execution. Network requests may
+take up to 30 seconds; a timeout or rejected command is reported without
+executing the model's unvalidated output.
 
 ### Terminal security and limitations
 

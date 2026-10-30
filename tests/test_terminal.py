@@ -1,11 +1,12 @@
 """Behavior and security tests for the FocusOS terminal module."""
 
+import io
 import json
 import subprocess
 from pathlib import Path
 import urllib.error
 from ai.terminal import (
-    HuggingFaceSuggester,
+    CohereSuggester,
     TerminalService,
     execute_command,
     filesystem_path,
@@ -114,30 +115,78 @@ def test_terminal_requires_confirmation_and_disables_package_install():
     assert "not supported" in service.execute("npm run test", confirmed=True)["stderr"]
 
 
-def test_missing_huggingface_credentials_disable_ai():
-    client = HuggingFaceSuggester(token="", model_id="")
+def test_cohere_client_requires_api_key(monkeypatch):
+    monkeypatch.setenv("COHERE_API_KEY", "")
+    client = CohereSuggester()
     assert not client.available
     assert client.suggest("git sta", ".", "linux") == []
 
 
-def test_huggingface_timeout_and_api_failures_return_empty():
+def test_cohere_timeout_and_api_failures_return_empty():
     def timeout(*args, **kwargs):
         raise TimeoutError("slow")
-    client = HuggingFaceSuggester(token="secret", model_id="model", opener=timeout)
+    client = CohereSuggester(api_key="test-key", opener=timeout)
     assert client.suggest("git sta", ".", "linux") == []
+    result = client.generate_assistant_commands("check git status", ".", "linux", "bash")
+    assert "slow" in result["error"]
     def unavailable(*args, **kwargs):
         raise urllib.error.HTTPError("url", 503, "unavailable", None, None)
-    client = HuggingFaceSuggester(token="secret", model_id="model", opener=unavailable)
+    client = CohereSuggester(api_key="test-key", opener=unavailable)
     assert client.suggest("git sta", ".", "linux") == []
 
 
-def test_huggingface_filters_untrusted_generated_commands():
+def test_cohere_v2_chat_request_and_response():
     class Response:
         def __enter__(self): return self
         def __exit__(self, *args): return False
         def read(self, limit):
-            return json.dumps([{"generated_text": '[{"command":"git status","explanation":"Check status"},{"command":"rm -rf .","explanation":"bad"}]'}]).encode()
-    client = HuggingFaceSuggester(token="secret", model_id="model", opener=lambda *a, **k: Response())
+            return json.dumps({"message": {"content": [{"type": "text", "text": '[{"command":"git status","explanation":"Check status"}]'}]}}).encode()
+
+    captured = {}
+
+    def opener(request, **kwargs):
+        captured["url"] = request.full_url
+        captured["payload"] = json.loads(request.data)
+        captured["content_type"] = request.get_header("Content-type")
+        captured["authorization"] = request.get_header("Authorization")
+        return Response()
+
+    client = CohereSuggester(api_key="test-key", model_id="command-a-03-2025", opener=opener)
+    result = client.generate_assistant_commands("check git status", ".", "linux", "bash")
+    assert result["ok"]
+    assert captured["url"] == "https://api.cohere.com/v2/chat"
+    assert captured["payload"]["model"] == "command-a-03-2025"
+    assert captured["payload"]["messages"][0]["role"] == "system"
+    assert captured["payload"]["messages"][1]["role"] == "user"
+    assert captured["payload"]["max_tokens"] == 300
+    assert captured["payload"]["temperature"] == 0
+    assert captured["payload"]["stream"] is False
+    assert captured["content_type"] == "application/json"
+    assert captured["authorization"] == "Bearer test-key"
+
+
+def test_cohere_http_error_includes_service_detail_without_key():
+    def rejected(request, **kwargs):
+        raise urllib.error.HTTPError(
+            request.full_url, 401, "Unauthorized", {},
+            io.BytesIO(b'{"message":"invalid api token"}'),
+        )
+
+    client = CohereSuggester(api_key="test-key", opener=rejected)
+    result = client.generate_assistant_commands("check git status", ".", "linux", "bash")
+    assert not result["ok"]
+    assert "HTTP 401" in result["error"]
+    assert "invalid api token" in result["error"]
+    assert "test-key" not in result["error"]
+
+
+def test_cohere_filters_untrusted_generated_commands():
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self, limit):
+            return json.dumps({"message": {"content": [{"type": "text", "text": '[{"command":"git status","explanation":"Check status"},{"command":"rm -rf .","explanation":"bad"}]'}]}}).encode()
+    client = CohereSuggester(api_key="test-key", opener=lambda *a, **k: Response())
     values = client.suggest("show status", ".", "linux")
     assert [item.command for item in values] == ["git status"]
 
@@ -147,29 +196,96 @@ def test_platform_interpreter_commands_validate():
     assert validate_command("python3 --version")[0] == ["python3", "--version"]
 
 
-def test_natural_language_requests_map_only_to_safe_supported_commands():
-    client = HuggingFaceSuggester(token="", model_id="")
+def test_natural_language_requests_require_cohere_configuration(monkeypatch):
+    monkeypatch.setenv("COHERE_API_KEY", "")
+    client = CohereSuggester()
     result = client.generate_assistant_commands("please check git status", ".", "linux", "bash")
-    assert result["ok"]
-    assert result["commands"] == ["git status"]
-
-    listing = client.generate_assistant_commands("show me the files in this folder", ".", "windows", "powershell")
-    assert listing["ok"]
-    assert listing["commands"] == ["dir"]
-
-    unsupported = client.generate_assistant_commands("delete all project files", ".", "windows", "powershell")
-    assert not unsupported["ok"]
-    assert unsupported["commands"] == []
+    assert not result["ok"]
+    assert "COHERE_API_KEY" in result["error"]
+    assert result["commands"] == []
+    assert client._generate_heuristic_commands("please check git status", ".", "linux", "bash")["commands"] == ["git status"]
 
 
-def test_ai_assistant_response_filters_commands_with_safety_policy():
+def test_ai_navigation_is_generated_and_validated_by_language_model(tmp_path):
+    target = tmp_path / "Folder With Spaces"
+    target.mkdir()
+
+    class Response:
+        def __init__(self, command):
+            self.command = command
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self, limit):
+            return json.dumps({"message": {"content": [{"type": "text", "text": json.dumps([{
+                "command": self.command,
+                "explanation": "Navigate to the requested folder",
+            }])}]}}).encode()
+
+    good = CohereSuggester(
+        api_key="test-key",
+        opener=lambda *a, **k: Response(f'cd "{target}"'),
+    )
+    navigation = good.generate_assistant_commands(
+        f'move to folder "{target}"', str(tmp_path), "windows", "powershell"
+    )
+    assert navigation["ok"]
+    assert navigation["commands"] == [f'cd "{target}"']
+
+    rejected_command = CohereSuggester(
+        api_key="test-key",
+        opener=lambda *a, **k: Response('cd ".."'),
+    )
+    rejected = rejected_command.generate_assistant_commands(
+        f'move to folder "{target}"', str(tmp_path), "windows", "powershell"
+    )
+    assert not rejected["ok"]
+    assert rejected["commands"] == []
+
+
+def test_ai_navigation_validator_supports_windows_paths_with_spaces(tmp_path):
+    from ai.terminal import _validate_ai_navigation
+
+    target = tmp_path / "Folder With Spaces"
+    target.mkdir()
+    windows_path = str(target).replace("/", "\\")
+    command = f'cd "{windows_path}"'
+    assert _validate_ai_navigation(command, f'move to folder "{windows_path}"', tmp_path)
+    assert not _validate_ai_navigation(f'{command}; whoami', f'move to folder "{windows_path}"', tmp_path)
+    assert not _validate_ai_navigation('cd "missing folder"', 'move to folder "missing folder"', tmp_path)
+
+
+def test_ai_navigation_validator_supports_linux_paths_and_rejects_invalid_targets(tmp_path):
+    from ai.terminal import _validate_ai_navigation
+
+    target = tmp_path / "linux folder"
+    target.mkdir()
+    command = f'cd "{target}"'
+    assert _validate_ai_navigation(command, f'move to folder "{target}"', tmp_path)
+    assert not _validate_ai_navigation('cd "missing folder"', 'move to folder "missing folder"', tmp_path)
+    assert not _validate_ai_navigation(command, f'move to folder "{tmp_path / "other"}"', tmp_path)
+
+
+def test_ai_assistant_response_rejects_command_injection():
     class Response:
         def __enter__(self): return self
         def __exit__(self, *args): return False
         def read(self, limit):
-            return json.dumps([{"generated_text": '[{"command":"git status","explanation":"Check status"},{"command":"git status; whoami","explanation":"unsafe"}]'}]).encode()
+            return json.dumps({"message": {"content": [{"type": "text", "text": '[{"command":"git status; whoami","explanation":"unsafe"}]'}]}}).encode()
 
-    client = HuggingFaceSuggester(token="secret", model_id="model", opener=lambda *a, **k: Response())
+    client = CohereSuggester(api_key="test-key", opener=lambda *a, **k: Response())
     result = client.generate_assistant_commands("check repository", ".", "linux", "bash")
-    assert result["ok"]
-    assert result["commands"] == ["git status"]
+    assert not result["ok"]
+    assert result["commands"] == []
+
+
+def test_ai_assistant_response_rejects_non_allowlisted_command():
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self, limit):
+            return json.dumps({"message": {"content": [{"type": "text", "text": '[{"command":"rm -rf .","explanation":"unsafe"}]'}]}}).encode()
+
+    client = CohereSuggester(api_key="test-key", opener=lambda *a, **k: Response())
+    result = client.generate_assistant_commands("clean files", ".", "linux", "bash")
+    assert not result["ok"]
+    assert result["commands"] == []

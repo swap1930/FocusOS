@@ -38,9 +38,7 @@ Card {
         if (commandText.trim().length === 0) return
         var command = commandText.trim()
         historyIndex = -1
-        var isCommand = backend.terminalIsCommand(command)
         backend.terminalRun(command)
-        if (!isCommand) backend.terminalCommandSubmitted(command)
         commandText = ""
         selectedIndex = -1
         updateSuggestions()
