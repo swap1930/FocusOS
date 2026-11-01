@@ -18,6 +18,9 @@ ApplicationWindow {
     property string issueText: ""
     property string clockText: ""
     property string terminalCommand: ""
+    property bool terminalHighImpact: false
+    property string terminalWarning: ""
+    property bool terminalExtraConfirmed: false
     property bool terminalPageOpen: false
 
     readonly property var resourceSeries: [
@@ -58,10 +61,7 @@ ApplicationWindow {
             win.issueText = text
             issuePopup.open()
         }
-        function onTerminalConfirmationRequested(command) {
-            win.terminalCommand = command
-            terminalConfirmPopup.open()
-        }
+
     }
 
     Timer {
@@ -417,7 +417,6 @@ ApplicationWindow {
                 wrapMode: Text.Wrap
             }
             Text {
-                text: backend.message
                 visible: text.length > 0
                 color: backend.messageKind === "error" ? Theme.red
                       : backend.messageKind === "warn" ? Theme.amber : Theme.muted
@@ -427,32 +426,6 @@ ApplicationWindow {
         }
     }
 
-    Popup {
-        id: terminalConfirmPopup
-        modal: true
-        anchors.centerIn: Overlay.overlay
-        width: 460
-        padding: 22
-        background: Rectangle { color: Theme.surface; border.color: Theme.borderStrong; radius: 12 }
-        contentItem: ColumnLayout {
-            spacing: 14
-            Text { text: "Confirm AI-suggested command"; color: Theme.text; font.pixelSize: 16; font.weight: Font.Bold }
-            Text { text: "Review this command before it runs:"; color: Theme.muted; wrapMode: Text.Wrap; Layout.fillWidth: true }
-            Text { text: win.terminalCommand; color: Theme.text; font.family: "monospace"; wrapMode: Text.Wrap; Layout.fillWidth: true }
-            RowLayout {
-                Layout.alignment: Qt.AlignRight
-                AppButton { text: "Cancel"; onClicked: terminalConfirmPopup.close() }
-                AppButton {
-                    text: "Run command"
-                    kind: "primary"
-                    onClicked: {
-                        terminalConfirmPopup.close()
-                        backend.terminalConfirmAI(win.terminalCommand)
-                    }
-                }
-            }
-        }
-    }
 
     Window {
         id: terminalWindow

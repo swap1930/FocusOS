@@ -18,6 +18,7 @@ Card {
     implicitHeight: terminalMode ? 650 : terminalColumn.implicitHeight + 36
 
     function updateSuggestions() {
+        if (backend.terminalInputLocked) return
         suggestionTimer.restart()
     }
     function updateOutputScroll() {
@@ -35,7 +36,7 @@ Card {
         }
     }
     function runCommand() {
-        if (commandText.trim().length === 0) return
+        if (backend.terminalInputLocked || commandText.trim().length === 0) return
         var command = commandText.trim()
         historyIndex = -1
         backend.terminalRun(command)
@@ -48,7 +49,7 @@ Card {
         id: suggestionTimer
         interval: 240
         repeat: false
-        onTriggered: backend.terminalSuggest(root.commandText)
+        onTriggered: if (!backend.terminalInputLocked) backend.terminalSuggest(root.commandText)
     }
     Timer {
         id: outputScrollTimer
@@ -118,8 +119,8 @@ Card {
                     spacing: 3
                     Text {
                         width: parent.width
-                        text: "> " + modelData.command + "  [exit " + modelData.returncode + "]"
-                        color: "#7ee787"
+                        text: "> " + modelData.command + (modelData.pending ? "  [working…]" : "  [exit " + modelData.returncode + "]")
+                        color: modelData.pending ? "#d2a8ff" : modelData.ok ? "#7ee787" : "#ff7b72"
                         font.family: "monospace"
                         wrapMode: Text.Wrap
                     }
@@ -204,14 +205,17 @@ Card {
                         root.selectedIndex = -1
                         root.updateSuggestions()
                     }
-                    placeholderText: root.terminalMode ? "Describe a task or enter a supported command…" : "Type a supported development command…"
-                    color: Theme.text
+                    enabled: !backend.terminalInputLocked
+                    placeholderText: backend.terminalInputLocked ? "Command running… wait for it to finish" : root.terminalMode ? "Describe a task or enter a shell command…" : "Type a shell command or describe a task…"
+                    color: enabled ? Theme.text : Theme.muted
                     placeholderTextColor: Theme.muted
                     font.family: "monospace"
                     background: Item {}
                     cursorDelegate: Rectangle { width: 1; color: Theme.accent; visible: input.activeFocus }
                     Keys.onPressed: (event) => {
-                        if (event.key === Qt.Key_Down) {
+                        if (backend.terminalInputLocked && event.key !== Qt.Key_Escape) {
+                            event.accepted = true
+                        } else if (event.key === Qt.Key_Down) {
                             if (root.suggestions.length > 0)
                                 root.selectedIndex = Math.min(root.selectedIndex + 1, root.suggestions.length - 1)
                             event.accepted = true
@@ -227,9 +231,11 @@ Card {
                             root.acceptSelectedSuggestion()
                             event.accepted = true
                         } else if (event.key === Qt.Key_Escape) {
-                            root.selectedIndex = -1
-                            root.commandText = ""
-                            backend.terminalSuggest("")
+                            if (!backend.terminalInputLocked) {
+                                root.selectedIndex = -1
+                                root.commandText = ""
+                                backend.terminalSuggest("")
+                            }
                             event.accepted = true
                         } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
                             if (root.selectedIndex >= 0) root.acceptSelectedSuggestion()
@@ -252,9 +258,9 @@ Card {
             }
         }
         Text {
-            text: root.terminalMode
-                  ? "FocusOS terminal · " + root.workingDirectory + " · AI requests map to allowlisted commands only; general shell execution is disabled."
-                  : "Allowlisted commands only, scoped to the FocusOS project directory. AI suggestions require separate confirmation; general shell execution is disabled."
+            text: backend.terminalInputLocked
+                  ? (backend.terminalRequestPending ? "Waiting for the API response… the prompt is locked." : "Command running in the terminal… wait for it to finish before entering another prompt.")
+                  : "FocusOS terminal · " + root.workingDirectory + " · AI-generated workflows run automatically when the API responds."
             color: Theme.muted
             font.pixelSize: 11
             wrapMode: Text.Wrap

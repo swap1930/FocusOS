@@ -33,17 +33,17 @@ Stop, Emergency Disable, resource-monitoring, and ML Focus controls are retained
 ## AI Terminal
 
 The dashboard includes an AI Terminal button that opens a separate terminal
-window. It provides local completions, command history, bounded output, exit
-codes, and a working-directory indicator. Local suggestions are provided for
-common Git, Python, and directory workflows. This is a constrained command
-runner, not a full interactive system shell: only read-only Git inspection,
-Python version, and directory-listing commands are supported. Python scripts,
-package operations, shell interpreters, and shell syntax are blocked. Directory
-navigation supports relative and absolute paths within the FocusOS project tree;
-paths outside that tree are rejected. Use Up/Down to navigate suggestions (Up
-at an empty selection navigates command history), Tab to fill a suggestion,
-Enter to accept a highlighted suggestion or execute input, and Escape to dismiss
-suggestions. Suggested commands are never executed automatically.
+window backed by a real PTY shell session. It provides local completions, command
+history, bounded displayed output, and a working-directory indicator. Cohere can
+generate general-purpose Windows PowerShell/CMD, Linux, or macOS shell commands,
+including file operations, package installation, scripts, Git, build tools, and
+multi-step workflows. Once the API returns a valid workflow, it is sent directly
+to the existing PTY and its output appears in the terminal. The prompt input is
+disabled while the workflow is being generated or running. AI-generated commands
+can make changes using the current user's operating-system permissions; review
+requests carefully. Use Up/Down to navigate suggestions (Up at an empty selection
+navigates command history), Tab to fill a suggestion, Enter to accept a
+highlighted suggestion or execute input, and Escape to dismiss suggestions.
 
 Optional Cohere assistance is configured using environment variables (or a
 local, git-ignored `.env` file):
@@ -58,29 +58,26 @@ Natural-language terminal requests require `COHERE_API_KEY` in the project-root
 `.env` file. `.env.example` is only a template and is not loaded by the app. Do
 not commit the key. If you receive HTTP 401, replace it with a valid key from
 Cohere; revoke any key previously shared publicly. `COHERE_MODEL` and
-`COHERE_API_URL` can be overridden if you use a different Cohere model or endpoint. Prompts containing the user's
-request, platform, and working directory are sent to Cohere. The API key is sent
+`COHERE_API_URL` can be overridden if you use a different Cohere model or
+endpoint. Prompts containing the user's request, platform, and working
+directory are sent to Cohere. The API key is sent
 only in the authorization header and is never exposed to QML/frontend or visible
-output. Model output is parsed and validated against FocusOS's restricted
-command policy and requires confirmation before execution. Network requests may
-take up to 30 seconds; a timeout or rejected command is reported without
-executing the model's unvalidated output.
+output. Model output is parsed and checked for valid bounded command text, then
+sent automatically to the real PTY. It is not treated as trusted; review natural-
+language requests carefully because generated commands can modify or delete data.
+Network requests may take up to 30 seconds; a timeout or invalid response is
+reported without executing model output.
 
 ### Terminal security and limitations
 
-This is a deliberately constrained local development terminal, not a general
-shell. It invokes subprocesses using argument arrays with `shell=False`, limits
-execution time and captured output, and accepts read-only Git inspection,
-Python version, and directory-listing commands. Shell chaining, redirection,
-privilege escalation, destructive disk/system tools, Python scripts/modules,
-PowerShell/cmd/shell interpreters, package operations, and npm/Node scripts are
-blocked.
-The `cd` command and terminal process working directory are restricted to the
-FocusOS project tree. Node/npm script execution is disabled because npm scripts
-can launch arbitrary programs. FocusOS does not automatically install packages,
-alter process priorities, suspend processes, or change system settings from
-terminal suggestions. A general-purpose shell would require a separate sandbox
-or stronger OS isolation boundary and is intentionally not implemented here.
+The AI terminal is a general-purpose local shell. Valid AI-generated workflows
+are automatically sent to the existing PTY as soon as the API response is
+validated; they are not treated as trusted. The prompt input is locked while a
+request or command is in progress. The shell inherits the current user's
+operating-system permissions, so generated commands can modify or delete data.
+Review natural-language requests carefully; this flow is not a substitute for
+OS-level sandboxing or backups. PTY output is bounded in the UI, and process/session
+cleanup remains handled by the terminal service.
 
 ## Existing utilities
 

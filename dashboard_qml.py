@@ -7,6 +7,9 @@ lives in the ``qml`` folder next to this file and is GPU rendered.
 from __future__ import annotations
 
 import os
+import re
+import shlex
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -31,7 +34,13 @@ from PySide6.QtQuickControls2 import QQuickStyle
 
 from config.settings import RESOURCE_PROFILES
 from core.focus_runtime import FocusRuntime
-from ai.terminal import Suggestion, TerminalService, _validate_ai_navigation, filesystem_path
+from ai.terminal import (
+    MAX_WORKFLOW_LENGTH,
+    Suggestion,
+    TerminalService,
+    filesystem_path,
+    validate_ai_command,
+)
 
 
 QML_DIR = Path(__file__).resolve().parent / "qml"
@@ -255,9 +264,42 @@ class DashboardBackend(QObject):
     terminalSuggestionsChanged = Signal()
     terminalOutputChanged = Signal()
     terminalBusyChanged = Signal()
-    terminalConfirmationRequested = Signal(str)
+    terminalInputLockedChanged = Signal()
+
     terminalHistoryChanged = Signal()
     terminalWorkingDirectoryChanged = Signal()
+
+    @staticmethod
+    def _looks_like_shell_command(text: str) -> bool:
+        """Route structured shell input directly; send ambiguous text to AI."""
+        value = text.strip()
+        if not value:
+            return False
+        if "\n" in value or "\r" in value or re.search(r"(?:&&|\|\||[;|<>`])", value):
+            return True
+        if value.startswith(("./", ".\\", "../", "..\\", "/", "~", "$", "#")):
+            return True
+        if re.match(r"^[A-Za-z]:[\\/]", value):
+            return True
+        if re.match(r"^[A-Za-z][A-Za-z0-9_.-]*\s+/(?!/)", value):
+            return True
+        try:
+            words = shlex.split(value, posix=os.name != "nt")
+        except ValueError:
+            return True
+        if not words:
+            return False
+        first = words[0]
+        if (first.startswith((".", "~", "/")) or re.match(r"^[A-Za-z]:[\\/]", first)
+                or "/" in first or "\\" in first):
+            return True
+        if first.casefold().endswith((".exe", ".bat", ".cmd", ".ps1", ".py", ".sh", ".com")):
+            return True
+        if len(words) > 1 and words[1].startswith(("-", "/")):
+            return True
+        # Check whether this is an executable currently on PATH without
+        # maintaining a command allowlist. Otherwise ambiguous text uses AI.
+        return bool(shutil.which(first)) and len(words) > 1
 
     def __init__(self, runtime: Optional[FocusRuntime] = None):
         super().__init__()
@@ -276,12 +318,18 @@ class DashboardBackend(QObject):
         self._closing = False
         self._shutdown_complete = False
         self._dark = False
-        self.terminal = TerminalService()
+        self.terminal = TerminalService(on_output=self._handle_terminal_pty_output)
         self._terminal_suggestions: List[Dict[str, str]] = []
         self._terminal_output: List[Dict[str, Any]] = []
         self._terminal_busy = False
+        self._terminal_input_locked = False
+        self._terminal_command_active = False
+        self._terminal_request_pending = False
         self._terminal_sequence = 0
         self._terminal_request_sequence = 0
+
+        self._pty_output_chunks: List[str] = []
+        self._pty_command_label = ""
         self._terminal_ai_worker.connect(self._finish_terminal_ai_result)
         self._terminal_request_worker.connect(self._execute_terminal_request, Qt.ConnectionType.QueuedConnection)
 
@@ -345,6 +393,14 @@ class DashboardBackend(QObject):
     def terminalBusy(self) -> bool:
         return self._terminal_busy
 
+    @Property(bool, notify=terminalInputLockedChanged)
+    def terminalInputLocked(self) -> bool:
+        return self._terminal_input_locked
+
+    @Property(bool, notify=terminalInputLockedChanged)
+    def terminalRequestPending(self) -> bool:
+        return self._terminal_request_pending
+
     @Property(bool, constant=True)
     def terminalAIAvailable(self) -> bool:
         return self.terminal.ai_available
@@ -355,6 +411,10 @@ class DashboardBackend(QObject):
 
     @Slot(str)
     def terminalSuggest(self, partial: str) -> None:
+        if self._terminal_command_active or self._terminal_request_pending:
+            return
+        if self._terminal_busy:
+            self._set_terminal_busy(False)
         self.terminal.invalidate_ai()
         self._terminal_sequence += 1
         self._terminal_suggestions = [
@@ -363,8 +423,7 @@ class DashboardBackend(QObject):
         ]
         self.terminalSuggestionsChanged.emit()
         if self.terminal.ai_available and partial.strip():
-            self._terminal_busy = True
-            self.terminalBusyChanged.emit()
+            self._set_terminal_busy(True)
             sequence = self._terminal_sequence
             def completed(items: List[Suggestion]) -> None:
                 self._terminal_ai_worker.emit(sequence, items)
@@ -377,7 +436,7 @@ class DashboardBackend(QObject):
     def _finish_terminal_ai_result(self, sequence: int, items: object) -> None:
         if sequence != self._terminal_sequence:
             return
-        self._terminal_busy = False
+        self._set_terminal_busy(False)
         local = self.terminal.suggestions("")
         self._terminal_suggestions = [
             {"command": item.command, "explanation": item.explanation, "source": item.source}
@@ -388,7 +447,6 @@ class DashboardBackend(QObject):
             for item in (items if isinstance(items, list) else [])
         )
         self._terminal_suggestions = self._terminal_suggestions[:15]
-        self.terminalBusyChanged.emit()
         self.terminalSuggestionsChanged.emit()
 
 
@@ -399,23 +457,35 @@ class DashboardBackend(QObject):
         clean = command.strip()
         if not clean:
             return
+        if "\x00" in clean:
+            self._append_terminal_result(clean, {
+                "ok": False,
+                "stdout": "",
+                "stderr": "Command contains an invalid NUL character.",
+                "returncode": -1,
+            })
+            return
+        if len(clean) > MAX_WORKFLOW_LENGTH:
+            self._append_terminal_result(clean, {
+                "ok": False,
+                "stdout": "",
+                "stderr": f"Terminal input exceeds the {MAX_WORKFLOW_LENGTH}-character limit.",
+                "returncode": -1,
+            })
+            return
+        if self._terminal_command_active or self._terminal_request_pending or self._terminal_input_locked:
+            return
+        if self._terminal_busy:
+            self._set_terminal_busy(False)
         self._terminal_request_sequence += 1
-        args, error = self.terminal.validate(clean)
-        if args is not None and not error:
-            ai_suggestion = any(
-                item.get("command") == clean and item.get("source") == "ai"
-                for item in self._terminal_suggestions
-            )
-            if ai_suggestion:
-                self.terminalConfirmationRequested.emit(clean)
-                return
+        if self._looks_like_shell_command(clean):
             self._execute_terminal_command(clean)
             return
         if len(clean) > 1024:
             self._append_terminal_result(clean, {
                 "ok": False,
                 "stdout": "",
-                "stderr": "Request is too long (maximum 1024 characters).",
+                "stderr": "Natural-language request is too long (maximum 1024 characters).",
                 "returncode": -1,
             })
             return
@@ -424,8 +494,18 @@ class DashboardBackend(QObject):
             self.terminal.history.append(clean)
         self.terminal.history = self.terminal.history[-200:]
         self.terminalHistoryChanged.emit()
-        self._terminal_busy = True
-        self.terminalBusyChanged.emit()
+        self._pty_command_label = f"AI request → {clean}"
+        self._pty_output_chunks = []
+        self._append_terminal_result(self._pty_command_label, {
+            "ok": True,
+            "stdout": "Waiting for AI response…",
+            "stderr": "",
+            "returncode": 0,
+            "pending": True,
+        })
+        self._terminal_request_pending = True
+        self._set_terminal_input_locked(True)
+        self._set_terminal_busy(True)
         self._terminal_suggestions = []
         self.terminalSuggestionsChanged.emit()
 
@@ -442,94 +522,143 @@ class DashboardBackend(QObject):
     def _execute_terminal_request(self, sequence: int, prompt: str, result: object) -> None:
         if sequence != self._terminal_request_sequence or self._closing:
             return
-        self._terminal_busy = False
-        self.terminalBusyChanged.emit()
         response = result if isinstance(result, dict) else {}
         commands = response.get("commands", [])
-        steps = response.get("steps", [])
         if not response.get("ok") or not isinstance(commands, list) or not commands:
-            self._append_terminal_result(prompt, {
+            self._append_terminal_result(f"AI request → {prompt}", {
                 "ok": False,
                 "stdout": "",
-                "stderr": str(response.get("error", "No safe command was generated for that request.")),
+                "stderr": str(response.get("error", "No command was generated for that request.")),
                 "returncode": -1,
             })
+            self._terminal_request_pending = False
+            self._set_terminal_input_locked(False)
+            self._set_terminal_busy(False)
             return
-        for index, command in enumerate(commands[:3]):
-            if not isinstance(command, str):
-                continue
-            args, error = self.terminal.validate(command)
-            is_natural_navigation = (
-                index == 0
-                and isinstance(response.get("prompt"), str)
-                and _validate_ai_navigation(command, response["prompt"], self.terminal.cwd)
-            )
-            if (args is None or error) and not is_natural_navigation:
-                self._append_terminal_result(prompt, {
-                    "ok": False,
-                    "stdout": "",
-                    "stderr": "The generated command was blocked by the terminal safety policy.",
-                    "returncode": -1,
-                })
-                return
-            if command.casefold().startswith("cd "):
-                result_row = self.terminal.execute(command, confirmed=True)
-                if result_row.get("ok") and result_row.get("cwd"):
-                    success, error_text = self.terminal.set_cwd(result_row["cwd"])
-                    if not success:
-                        result_row = {
-                            "ok": False,
-                            "stdout": "",
-                            "stderr": error_text or "Could not change the terminal working directory.",
-                            "returncode": -1,
-                        }
-            else:
-                result_row = self.terminal.execute(command, confirmed=True)
-            step = steps[index] if index < len(steps) and isinstance(steps[index], dict) else {}
-            description = str(step.get("description", "")).strip()
-            displayed_command = f"{prompt} → {command}" if index == 0 else command
-            if description and not result_row.get("stderr"):
-                result_row["stdout"] = (description + "\n" + str(result_row.get("stdout", ""))).strip()
-            self._append_terminal_result(displayed_command, result_row)
-            if not result_row.get("ok"):
-                break
-
-    @Slot(str)
-    def terminalConfirmAI(self, command: str) -> None:
-        if self._closing:
-            return
-        is_current_ai = any(
-            item.get("command") == command and item.get("source") == "ai"
-            for item in self._terminal_suggestions
-        )
-        if not is_current_ai:
-            return
-        if self.terminal.execute(command, confirmed=False).get("confirmation_required"):
-            self._append_terminal_result(command, {
+        if len(commands) != 1:
+            self._append_terminal_result(f"AI request → {prompt}", {
                 "ok": False,
                 "stdout": "",
-                "stderr": "This AI-suggested command is blocked by the terminal's safety policy.",
+                "stderr": "The API must return exactly one command; nothing was executed.",
+                "returncode": -1,
             })
+            self._terminal_request_pending = False
+            self._set_terminal_input_locked(False)
+            self._set_terminal_busy(False)
             return
-        result = self.terminal.execute(command, confirmed=True)
-        self._append_terminal_result(command, result)
+        complete_commands = []
+        for command in commands:
+            if not isinstance(command, str):
+                self._append_terminal_result(f"AI request → {prompt}", {
+                    "ok": False, "stdout": "", "stderr": "The generated command contained an invalid step.", "returncode": -1,
+                })
+                self._terminal_request_pending = False
+                self._set_terminal_input_locked(False)
+                self._set_terminal_busy(False)
+                return
+            valid, error = validate_ai_command(command)
+            if not valid:
+                self._append_terminal_result(f"AI request → {prompt}", {
+                    "ok": False, "stdout": "", "stderr": error, "returncode": -1,
+                })
+                self._terminal_request_pending = False
+                self._set_terminal_input_locked(False)
+                self._set_terminal_busy(False)
+                return
+            complete_commands.append(command)
+        full_script = complete_commands[0]
+        if len(full_script) > MAX_WORKFLOW_LENGTH:
+            self._append_terminal_result(f"AI request → {prompt}", {
+                "ok": False, "stdout": "", "stderr": f"The generated workflow exceeds {MAX_WORKFLOW_LENGTH} characters; nothing was executed.", "returncode": -1,
+            })
+            self._terminal_request_pending = False
+            self._set_terminal_input_locked(False)
+            self._set_terminal_busy(False)
+            return
+        self._terminal_request_pending = False
+        self._execute_terminal_command(full_script, label=f"AI request → {prompt}")
 
-    def _execute_terminal_command(self, command: str) -> None:
-        is_ai_suggestion = any(
-            item.get("command") == command and item.get("source") == "ai"
-            for item in self._terminal_suggestions
-        )
-        result = self.terminal.execute(command, confirmed=not is_ai_suggestion)
-        self._append_terminal_result(command, result)
+    def _set_terminal_busy(self, busy: bool) -> None:
+        if self._terminal_busy != busy:
+            self._terminal_busy = busy
+            self.terminalBusyChanged.emit()
+
+    def _set_terminal_input_locked(self, locked: bool) -> None:
+        if self._terminal_input_locked != locked:
+            self._terminal_input_locked = locked
+            self.terminalInputLockedChanged.emit()
+
+    def _execute_terminal_command(self, command: str, label: str | None = None) -> None:
+        self._terminal_request_pending = False
+        self._set_terminal_input_locked(True)
+        self.terminal.on_output = self._handle_terminal_pty_output
+        self._pty_command_label = label or command
+        self._pty_output_chunks = []
+        self._append_terminal_result(self._pty_command_label, {
+            "ok": True,
+            "stdout": "Running in live terminal…",
+            "stderr": "",
+            "returncode": 0,
+            "pending": True,
+        })
+        self._terminal_command_active = True
+        if not self.terminal.run_pty_command(command, on_complete=self._handle_terminal_command_complete):
+            self._terminal_command_active = False
+            self._append_terminal_result(self._pty_command_label, {
+                "ok": False,
+                "stdout": "",
+                "stderr": "A terminal command is already running.",
+                "returncode": -1,
+            })
+            self._set_terminal_input_locked(False)
+            self._set_terminal_busy(False)
+            return
+        self._set_terminal_busy(True)
+
+    def _handle_terminal_command_complete(self) -> None:
+        self._terminal_command_active = False
+        self._set_terminal_input_locked(False)
+        self._set_terminal_busy(False)
+        if self._terminal_output and self._terminal_output[-1].get("command") == self._pty_command_label:
+            self._terminal_output[-1]["pending"] = False
+            self.terminalOutputChanged.emit()
+        self._pty_command_label = ""
+
+    def _handle_terminal_pty_output(self, text: str) -> None:
+        if not self._terminal_command_active:
+            return
+        self._pty_output_chunks.append(text)
+        if len(self._pty_output_chunks) > 2000:
+            self._pty_output_chunks = self._pty_output_chunks[-1500:]
+        output = "".join(self._pty_output_chunks)[-16000:]
+        row = {
+            "command": self._pty_command_label or "Terminal output",
+            "stdout": output or "Command is running; waiting for terminal output…",
+            "stderr": "",
+            "returncode": 0,
+            "ok": True,
+            "pending": True,
+        }
+        if self._terminal_output and self._terminal_output[-1].get("command") == row["command"]:
+            self._terminal_output[-1] = row
+        else:
+            self._terminal_output.append(row)
+        self._terminal_output = self._terminal_output[-100:]
+        self.terminalOutputChanged.emit()
 
     def _append_terminal_result(self, command: str, result: Dict[str, Any]) -> None:
-        self._terminal_output.append({
+        row = {
             "command": command,
             "stdout": str(result.get("stdout", ""))[:16000],
             "stderr": str(result.get("stderr", ""))[:16000],
             "returncode": int(result.get("returncode", -1)),
             "ok": bool(result.get("ok")),
-        })
+            "pending": bool(result.get("pending", False)),
+        }
+        if self._terminal_output and self._terminal_output[-1].get("command") == command and self._terminal_output[-1].get("pending"):
+            self._terminal_output[-1] = row
+        else:
+            self._terminal_output.append(row)
         self._terminal_output = self._terminal_output[-100:]
         self.terminalOutputChanged.emit()
         self.terminalHistoryChanged.emit()
@@ -562,7 +691,9 @@ class DashboardBackend(QObject):
             return False
         if not selected.is_dir():
             return False
-        self.terminal.cwd = str(selected)
+        success, error = self.terminal.set_cwd(selected)
+        if not success:
+            return False
         self.terminal.invalidate_ai()
         self._terminal_suggestions = []
         self.terminalSuggestionsChanged.emit()
