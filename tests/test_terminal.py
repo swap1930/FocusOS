@@ -307,6 +307,18 @@ def test_ai_response_marks_destructive_single_command_without_confirmation():
     assert "automatically" in result["warning"]
 
 
+def test_powershell_command_wrapper_is_single_line_and_quotes_marker():
+    from ai.terminal import PTYSession
+
+    session = PTYSession.__new__(PTYSession)
+    session.shell_name = "powershell"
+    command = 'Get-ChildItem -Path . -Directory'
+    script = session._command_script(command)
+    assert script.startswith("& { " + command + " }; Write-Output '")
+    assert "\n" not in script
+    assert session._command_done_token in script
+
+
 def test_pty_command_lock_rejects_parallel_command(monkeypatch):
     service = TerminalService()
     submitted = []

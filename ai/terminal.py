@@ -281,6 +281,7 @@ class PTYSession:
         self._command_lock = threading.Lock()
         self._command_active = False
         self._command_done_token: str | None = None
+        self._command_output_buffer = ""
         self._on_command_complete = None
         self.output_history: list[str] = []
         self._start()
@@ -360,13 +361,29 @@ class PTYSession:
                     break
                 clean = strip_ansi(chunk)
                 token = None
+                visible = clean
+                complete = False
                 with self._command_lock:
-                    if self._command_active and self._command_done_token and self._command_done_token in clean:
-                        token = self._command_done_token
-                        self._command_done_token = None
-                visible = clean.replace(token, "") if token else clean
-                if token:
+                    token = self._command_done_token
+                    if token and self._command_active:
+                        pending = self._command_output_buffer + visible
+                        if token in pending:
+                            before, _, after = pending.partition(token)
+                            visible = before + after
+                            self._command_output_buffer = ""
+                            complete = True
+                        else:
+                            keep = max(0, len(token) - 1)
+                            split = max(0, len(pending) - keep)
+                            visible = pending[:split]
+                            self._command_output_buffer = pending[split:]
+                    else:
+                        token = None
+                if complete:
                     self._complete_active_command()
+                if not token:
+                    visible = clean
+
                 if visible:
                     with self._lock:
                         self.output_history.append(visible)
@@ -398,6 +415,8 @@ class PTYSession:
             if not self._command_active:
                 return
             self._command_active = False
+            self._command_done_token = None
+            self._command_output_buffer = ""
             on_complete = self._on_command_complete
             self._on_command_complete = None
         if on_complete:
@@ -407,12 +426,10 @@ class PTYSession:
         self._command_done_token = f"__FOCUSOS_DONE_{uuid.uuid4().hex}__"
         token = self._command_done_token
         if self.shell_name == "powershell":
-            return f"{command}; Write-Output '{token}'"
+            return f"& {{ {command} }}; Write-Output '{token}'"
         if self.shell_name == "cmd":
             return f"{command} & echo {token}"
-        if self.shell_name in {"bash", "zsh", "sh", "fish", "dash"}:
-            return f"{command}; printf '\\n{token}\\n'"
-        return f"{command}; echo {token}"
+        return f"{{ {command}; }}; printf '\\n{token}\\n'"
 
     def write_command(self, command: str, on_complete=None) -> bool:
         newline = "\r\n" if sys.platform == "win32" else "\n"
@@ -467,6 +484,7 @@ class PTYSession:
         with self._command_lock:
             self._command_active = False
             self._command_done_token = None
+            self._command_output_buffer = ""
             self._on_command_complete = None
         if self._pty is not None:
             try:
