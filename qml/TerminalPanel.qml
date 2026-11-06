@@ -113,6 +113,8 @@ Card {
                 anchors.margins: 12
                 clip: true
                 spacing: 8
+                boundsBehavior: Flickable.StopAtBounds
+                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
                 model: root.outputRows
                 delegate: Column {
                     width: outputView.width
@@ -130,7 +132,8 @@ Card {
                         text: modelData.stdout
                         color: "#e6edf3"
                         font.family: "monospace"
-                        wrapMode: Text.Wrap
+                        wrapMode: Text.WrapAnywhere
+                        textFormat: Text.PlainText
                     }
                     Text {
                         width: parent.width
@@ -138,10 +141,12 @@ Card {
                         text: modelData.stderr
                         color: "#ff7b72"
                         font.family: "monospace"
-                        wrapMode: Text.Wrap
+                        wrapMode: Text.WrapAnywhere
+                        textFormat: Text.PlainText
                     }
                 }
                 onCountChanged: root.updateOutputScroll()
+                onContentHeightChanged: root.updateOutputScroll()
             }
         }
 

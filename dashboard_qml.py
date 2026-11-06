@@ -36,6 +36,7 @@ from config.settings import RESOURCE_PROFILES
 from core.focus_runtime import FocusRuntime
 from ai.terminal import (
     MAX_WORKFLOW_LENGTH,
+    MAX_OUTPUT_CHARS,
     Suggestion,
     TerminalService,
     filesystem_path,
@@ -628,9 +629,7 @@ class DashboardBackend(QObject):
         if not self._terminal_command_active:
             return
         self._pty_output_chunks.append(text)
-        if len(self._pty_output_chunks) > 2000:
-            self._pty_output_chunks = self._pty_output_chunks[-1500:]
-        output = "".join(self._pty_output_chunks)[-16000:]
+        output = "".join(self._pty_output_chunks)[-MAX_OUTPUT_CHARS:]
         row = {
             "command": self._pty_command_label or "Terminal output",
             "stdout": output or "Command is running; waiting for terminal output…",

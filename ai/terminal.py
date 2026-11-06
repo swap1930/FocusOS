@@ -360,29 +360,25 @@ class PTYSession:
                 else:
                     break
                 clean = strip_ansi(chunk)
-                token = None
-                visible = clean
                 complete = False
                 with self._command_lock:
-                    token = self._command_done_token
-                    if token and self._command_active:
-                        pending = self._command_output_buffer + visible
-                        if token in pending:
-                            before, _, after = pending.partition(token)
+                    active_token = self._command_done_token
+                    if active_token and self._command_active:
+                        pending = self._command_output_buffer + clean
+                        if active_token in pending:
+                            before, _, after = pending.partition(active_token)
                             visible = before + after
                             self._command_output_buffer = ""
                             complete = True
                         else:
-                            keep = max(0, len(token) - 1)
+                            keep = max(0, len(active_token) - 1)
                             split = max(0, len(pending) - keep)
                             visible = pending[:split]
                             self._command_output_buffer = pending[split:]
                     else:
-                        token = None
+                        visible = clean
                 if complete:
                     self._complete_active_command()
-                if not token:
-                    visible = clean
 
                 if visible:
                     with self._lock:
